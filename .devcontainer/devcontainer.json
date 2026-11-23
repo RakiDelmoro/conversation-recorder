@@ -1,0 +1,80 @@
+// conversation-recorder — ESP32-S3 + ReSpeaker XVF3800 firmware
+// Trigger design: NO wake word. Recording starts on a VAD / energy gate applied
+// to the XVF3800's processed I2S channel, stops after a long silence gap, then
+// the clip is sent over the LAN to a separate processing machine.
+{
+    "name": "conversation-recorder (ESP32-S3)",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": { "IDF_VERSION": "release-v5.4" }
+    },
+
+    "runArgs": [
+        // --- USB: flashing / `idf.py monitor` / JTAG -------------------------
+        // "--privileged" + "/dev" bind keeps working across cable re-plugs.
+        // Least-privilege alternative (board must be plugged in *before* start):
+        //   ["--device=/dev/ttyACM0", "--device=/dev/ttyUSB0"]
+        "--privileged",
+        "--mount=type=bind,source=/dev,target=/dev",
+
+        // --- LAN ingest: recording is thrown to a separate machine -----------
+        // Published on the HOST's 0.0.0.0 so the ESP32 can reach it directly.
+        // (VS Code's forwardPorts alone binds 127.0.0.1 — the device can't see it.)
+        "--publish=8000:8000/tcp",
+        "--publish=8000:8000/udp"
+    ],
+
+    // If the firmware discovers the receiver via mDNS (.local) or multicast,
+    // bridge networking blocks it. On a Linux host, replace the two --publish
+    // flags above with "--network=host" and drop forwardPorts below.
+    // (Not available on Docker Desktop for macOS/Windows.)
+
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "username": "vscode",
+            "upgradePackages": false
+        },
+        "ghcr.io/devcontainers/features/github-cli:1": {}
+    },
+
+    "remoteUser": "vscode",
+
+    "containerEnv": {
+        "IDF_CCACHE_ENABLE": "1",
+        // Dev-side test clients target the real processing box.
+        // Firmware-side endpoint belongs in Kconfig/sdkconfig, not here.
+        "RECORDER_PEER_HOST": "192.168.1.50",
+        "RECORDER_PEER_PORT": "8000"
+    },
+
+    "postCreateCommand": "bash -lc '. /etc/profile.d/10-esp-idf.sh; sudo usermod -aG dialout,plugdev $USER 2>/dev/null || true; idf.py --version'",
+
+    "forwardPorts": [8000],
+    "portsAttributes": {
+        "8000": { "label": "recording ingest (tcp+udp)", "onAutoForward": "silent" }
+    },
+
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "espressif.esp-idf-extension",
+                "ms-vscode.cpptools",
+                "ms-vscode.cmake-tools",
+                "ms-vscode.vscode-serial-monitor",
+                "EditorConfig.EditorConfig",
+                "eamodio.gitlens",
+                "usernamehw.errorlens"
+            ],
+            "settings": {
+                // Paths match the espressif/idf image layout.
+                "idf.espIdfPath": "/opt/esp/idf",
+                "idf.toolsPath": "/opt/esp",
+                "idf.adapterTargetName": "esp32s3",
+                "idf.flashType": "UART",
+                "idf.openOcdConfigs": ["board/esp32s3-builtin.cfg"],
+                "idf.port": "/dev/ttyACM0",
+                "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json"
+            }
+        }
+    }
+}
