@@ -69,8 +69,23 @@ development container does not pass through USB.
 
 ## Build
 
+Fresh container, first time:
+
 ```sh
-cargo install ldproxy --locked   # one-time
+# If the image does not already provide the Xtensa Rust toolchain:
+cargo install espup --locked
+espup install --targets esp32s3
+. "$HOME/export-esp.sh"
+
+# Install the linker proxy with the host toolchain, not the esp toolchain:
+cargo +stable install ldproxy --locked
+
+cargo build --release
+```
+
+Subsequent builds only need:
+
+```sh
 cargo build --release
 ```
 
@@ -86,6 +101,12 @@ minutes. Use `cargo build -vv` for progress.
 The devcontainer uses `espressif/idf-rust:all_latest`. `.cargo/config.toml`
 sets `ESP_IDF_TOOLS_INSTALL_DIR = "fromenv"` because the image activates an
 ESP-IDF environment, and pins `ESP_IDF_VERSION = "v5.4"`.
+
+If `cargo +stable` is unavailable, install the host toolchain first:
+
+```sh
+rustup toolchain install stable
+```
 
 If ESP-IDF's CMake rejects the Xtensa GCC version, the compiler installed by
 `espup` is shadowing the container's IDF toolchain. Put the IDF compiler first
