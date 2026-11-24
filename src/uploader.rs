@@ -251,32 +251,14 @@ fn drain_acks(
     };
     *rx_len += n;
 
-    while *rx_len >= protocol::HDR_LEN {
-        let magic = u32::from_le_bytes(rx[0..4].try_into().unwrap());
-        let version = rx[4];
-        let typ = rx[5];
-        let flags = u16::from_le_bytes([rx[6], rx[7]]);
-        let len = u32::from_le_bytes(rx[8..12].try_into().unwrap()) as usize;
-        if magic != protocol::MAGIC || version != protocol::VERSION {
-            bail!("bad ACK header");
-        }
-        if typ != protocol::ACK || len != protocol::ACK_LEN {
-            bail!("unexpected record type 0x{typ:02x} len {len}");
-        }
-        if *rx_len < protocol::HDR_LEN + len {
-            break;
-        }
-        let ack = protocol::decode_ack(&rx[protocol::HDR_LEN..protocol::HDR_LEN + len])
-            .ok_or_else(|| anyhow!("malformed ACK"))?;
+    while let Some(ack) = protocol::take_ack(rx, rx_len)? {
         if ack.session_id == c.id {
             c.acked = c.acked.max(ack.acked_samples);
             shared.ack(c.id, c.acked);
-            if flags & 1 != 0 {
+            if ack.final_ack {
                 c.end_ack = true;
             }
         }
-        rx.copy_within(protocol::HDR_LEN + len..*rx_len, 0);
-        *rx_len -= protocol::HDR_LEN + len;
     }
     Ok(())
 }

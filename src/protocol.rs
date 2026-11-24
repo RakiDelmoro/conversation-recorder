@@ -76,3 +76,43 @@ pub fn decode_ack(payload: &[u8]) -> Option<Ack> {
         acked_samples: u32::from_le_bytes(payload[4..8].try_into().ok()?),
     })
 }
+
+pub struct AckRecord {
+    pub session_id: u32,
+    pub acked_samples: u32,
+    pub final_ack: bool,
+}
+
+/// Parse one ACK record from the front of `buf[..*len]`.
+///
+/// Returns `Ok(None)` when the record is still incomplete. On success the
+/// record is removed from the buffer and `*len` is reduced. Fails if the
+/// buffered bytes do not start with a well-formed ACK record.
+pub fn take_ack(buf: &mut [u8], len: &mut usize) -> anyhow::Result<Option<AckRecord>> {
+    if *len < HDR_LEN {
+        return Ok(None);
+    }
+    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let version = buf[4];
+    let typ = buf[5];
+    let flags = u16::from_le_bytes([buf[6], buf[7]]);
+    let payload_len = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    if magic != MAGIC || version != VERSION {
+        anyhow::bail!("bad ACK header");
+    }
+    if typ != ACK || payload_len != ACK_LEN {
+        anyhow::bail!("unexpected record type 0x{typ:02x} len {payload_len}");
+    }
+    if *len < HDR_LEN + payload_len {
+        return Ok(None);
+    }
+    let ack = decode_ack(&buf[HDR_LEN..HDR_LEN + payload_len])
+        .ok_or_else(|| anyhow::anyhow!("malformed ACK"))?;
+    buf.copy_within(HDR_LEN + payload_len..*len, 0);
+    *len -= HDR_LEN + payload_len;
+    Ok(Some(AckRecord {
+        session_id: ack.session_id,
+        acked_samples: ack.acked_samples,
+        final_ack: flags & 1 != 0,
+    }))
+}

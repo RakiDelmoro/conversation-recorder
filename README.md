@@ -3,11 +3,19 @@
 Firmware for an XIAO ESP32-S3 Plus mounted on a Seeed reSpeaker XVF3800
 four-microphone array. The device performs always-on capture, gates speech with
 an on-device TEN VAD model, segments utterances, buffers unacknowledged audio
-in PSRAM, and streams 16 kHz mono PCM over TCP to a receiver that owns STT and
+in PSRAM, and streams 16 kHz mono PCM to a receiver that owns STT and
 downstream knowledge-base processing.
 
-The receiver is discovered automatically over UDP; no static receiver address
-is required.
+Two transports carry the same records (`src/protocol.rs`), selected by
+`TRANSPORT` in `src/config.rs`:
+
+- **USB (default).** The board is cabled to the computer and streams over the
+  native USB port as a CDC serial device (`/dev/ttyACM0`). No Wi-Fi, no
+  discovery.
+- **TCP.** Wi-Fi station plus UDP discovery, as described below.
+
+The receiver is discovered automatically over UDP in TCP mode; no static
+receiver address is required.
 
 ## Architecture
 
@@ -18,9 +26,9 @@ flowchart LR
   V --> R["recorder"]
   A --> R
   R --> Q["PSRAM queue<br/>4 MB"]
-  Q --> U["TCP uploader"]
+  Q --> U["transport<br/>USB CDC / TCP"]
   U <-->|"START / AUDIO / END / ACK"| H["receiver"]
-  D["UDP discovery"] <-->|"beacon / offer"| H
+  D["UDP discovery<br/>(TCP mode)"] <-->|"beacon / offer"| H
   D -->|"selected peer"| U
   X -->|"I2C DoA + fallback"| R
 ```
@@ -33,8 +41,8 @@ Data path:
 3. TEN VAD classifies 256-sample (16 ms) frames.
 4. The recorder applies pre-roll, minimum-speech, holdback, and segment-cap
    rules, then queues `START`/`AUDIO`/`END` records.
-5. The uploader drains the queue over TCP and frees slots only after receiver
-   ACKs.
+5. The transport (USB CDC or TCP) drains the queue and frees slots only after
+   receiver ACKs.
 6. The receiver writes one WAV per segment and performs STT asynchronously.
 
 ## Repository layout
@@ -45,6 +53,7 @@ Data path:
 | `src/audio.rs` | I2S capture, channel extraction, 48→16 kHz decimation |
 | `src/recorder.rs` | Segmentation state machine and queue producer |
 | `src/queue.rs` | Fixed-slot PSRAM ring with ACK-driven reclamation |
+| `src/usb.rs` | USB CDC transport (default) |
 | `src/uploader.rs` | TCP transport and ACK/resume logic |
 | `src/discovery.rs` | UDP beacon and receiver offer handling |
 | `src/xvf3800.rs` | I2C firmware probe, ASR routing, DoA polling |
@@ -137,6 +146,7 @@ All build-time settings live in `src/config.rs`.
 | `SILENCE_TIMEOUT_MS` | `3_000` | Segment ends after this much silence |
 | `SEGMENT_MS` | `60_000` | Hard cap for continuous speech |
 | `QUEUE_BYTES` | `4 MB` | Unacknowledged audio buffer |
+| `TRANSPORT` | `Usb` | `Usb` (cable, no Wi-Fi) or `Tcp` (Wi-Fi + discovery) |
 
 ## Flash
 
@@ -233,11 +243,34 @@ boundary. The first segment's cap includes the pre-roll window.
 | Recording | Solid on |
 | Idle | 20 ms on / 2000 ms period |
 
-## Discovery and transport
+## USB transport (default)
 
-The device advertises itself over UDP; the receiver chooses the device and
-supplies its own TCP address. This keeps the device as the TCP client, so no
-inbound port or firewall rule is required on the device.
+With `TRANSPORT = Usb` the board does not start Wi-Fi or discovery. It streams
+the same records over its native USB port, which the host exposes as a CDC
+serial device:
+
+```sh
+python3 tools/ingest_server.py --serial /dev/ttyACM0 --out recordings
+```
+
+- `--serial` opens the port raw, writes one WAV per segment, and sends ACKs
+  back over the same port. The ACKs drive the same PSRAM reclamation as TCP.
+- The ESP-IDF console shares the port, so boot and runtime log lines appear
+  between records. The receiver skips them by resyncing on the record magic;
+  keep each record small enough for one write (the firmware uses a single
+  write per record into an 8 KB TX ring).
+- Stop the receiver before `espflash flash`; it holds the port open.
+- If the cable drops, the device rewinds to the last ACK. The receiver reopens
+  the port and the device resends `START` with that offset, so the partial WAV
+  is truncated and continued.
+- Under WSL2, attach the USB device first (`usbipd attach --wsl --busid <id>`);
+  it then appears as `/dev/ttyACM0`.
+
+## Discovery and transport (TCP mode)
+
+With `TRANSPORT = Tcp` the device advertises itself over UDP; the receiver
+chooses the device and supplies its own TCP address. This keeps the device as
+the TCP client, so no inbound port or firewall rule is required on the device.
 
 ### Discovery messages
 
@@ -322,6 +355,8 @@ ACK header flag bit 0 marks the final ACK sent after `END`.
 | UDP broadcast blocked | Use static `PEER_HOST` or `--no-discovery` |
 | Empty `PAIRING_TOKEN` | Discovery disabled; use static `PEER_HOST` |
 | Wrong token | Device ignores the offer |
+| USB host absent | No records leave the device; queue fills as with no receiver |
+| USB cable drop | Uploader rewinds to the last ACK; receiver reopens the port and resumes |
 | XVF I2S firmware absent | No usable I2S clock/data; rate check logs failure |
 | TEN VAD init failure | Falls back to XVF speech flag, then energy VAD |
 
@@ -352,7 +387,9 @@ python3 tools/test_ingest_server.py -v
 ```
 
 The tests cover START/AUDIO/END ingestion, WAV correctness, resume after
-disconnect, rejection of a resume gap, beacon listing, and offer generation.
+disconnect, rejection of a resume gap, beacon listing, offer generation, and
+the USB path (record parsing over a PTY, console-text resync, resume after a
+link drop).
 
 TEN VAD port validation: the C implementation was compared against the
 upstream TEN VAD library on a 720-frame speech file. Maximum absolute

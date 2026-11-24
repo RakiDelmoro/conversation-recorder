@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Reference ingest server for the conversation-recorder firmware.
 
-Receives START/AUDIO/END records over TCP, writes one 16-bit PCM WAV per
-utterance, and acknowledges received sample counts so the device can resume
-after a network loss.
+Receives START/AUDIO/END records over TCP, or over a USB CDC serial device with
+``--serial``, writes one 16-bit PCM WAV per utterance, and acknowledges
+received sample counts so the device can resume after a link loss.
 """
 
 import argparse
 import asyncio
 import logging
+import os
+import select
 import socket
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,12 +25,16 @@ END = struct.Struct("<IIB3xI")
 ACK = struct.Struct("<II")
 
 MAGIC = 0x43455243
+MAGIC_BYTES = struct.pack("<I", MAGIC)
 VERSION = 1
 
 TYPE_START = 1
 TYPE_AUDIO = 2
 TYPE_END = 3
 TYPE_ACK = 0x81
+
+MAX_AUDIO_BYTES = 6400
+RETRY_OPEN_SECONDS = 1.0
 
 FINAL_ACK_FLAG = 0x0001
 FINALIZE_IDLE_SECONDS = 300.0
@@ -64,6 +71,76 @@ class Device:
     queue_bytes: int
     uptime_ms: int
     address: Tuple[str, int]
+
+
+class Framer:
+    """Splits a byte stream into protocol records.
+
+    With ``resync`` the stream may also carry device console text (the USB
+    transport shares the port with the ESP-IDF log), so sync is recovered by
+    scanning for a plausible record header.
+    """
+
+    def __init__(self, reader: asyncio.StreamReader, resync: bool = False):
+        self.reader = reader
+        self.resync = resync
+        self.buf = bytearray()
+
+    async def _fill(self, size: int) -> None:
+        while len(self.buf) < size:
+            chunk = await self.reader.read(65536)
+            if not chunk:
+                raise asyncio.IncompleteReadError(bytes(self.buf), size)
+            self.buf.extend(chunk)
+
+    @staticmethod
+    def _plausible(typ: int, length: int) -> bool:
+        if typ == TYPE_START:
+            return length == START.size
+        if typ == TYPE_END:
+            return length == END.size
+        if typ == TYPE_ACK:
+            return length == ACK.size
+        if typ == TYPE_AUDIO:
+            return 0 < length <= MAX_AUDIO_BYTES and length % 2 == 0
+        return False
+
+    async def _resync(self) -> None:
+        while True:
+            await self._fill(HDR.size)
+            idx = self.buf.find(MAGIC_BYTES)
+            if idx < 0:
+                del self.buf[: max(0, len(self.buf) - (len(MAGIC_BYTES) - 1))]
+                continue
+            if idx:
+                log.debug("skipping %d non-protocol bytes", idx)
+                del self.buf[:idx]
+            await self._fill(HDR.size)
+            _magic, version, typ, _flags, length = HDR.unpack_from(self.buf)
+            if version == VERSION and self._plausible(typ, length):
+                return
+            del self.buf[0]
+
+    async def next_record(self) -> Tuple[int, int, bytes]:
+        if self.resync:
+            await self._resync()
+        else:
+            await self._fill(HDR.size)
+            magic, version, typ, _flags, length = HDR.unpack_from(self.buf)
+            if (
+                magic != MAGIC
+                or version != VERSION
+                or not self._plausible(typ, length)
+            ):
+                raise ValueError(
+                    f"bad header magic={magic:08x} version={version} "
+                    f"type={typ:#04x} length={length}"
+                )
+        _magic, _version, typ, flags, length = HDR.unpack_from(self.buf)
+        await self._fill(HDR.size + length)
+        payload = bytes(self.buf[HDR.size : HDR.size + length])
+        del self.buf[: HDR.size + length]
+        return typ, flags, payload
 
 
 def parse_beacon(data: bytes, address: Tuple[str, int]) -> Optional[Device]:
@@ -195,9 +272,13 @@ class IngestServer:
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
         self.server = await asyncio.start_server(self.handle, host, port)
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        self.start_cleanup()
         sock = self.server.sockets[0]
         return sock.getsockname()[1]
+
+    def start_cleanup(self) -> None:
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def stop(self) -> None:
         if self._cleanup_task is not None:
@@ -262,19 +343,22 @@ class IngestServer:
         await writer.drain()
 
     async def handle(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self,
+        reader: asyncio.StreamReader,
+        writer,
+        resync: bool = False,
     ) -> None:
         peer = writer.get_extra_info("peername")
         log.info("connection from %s", peer)
         current: Optional[Session] = None
+        framer = Framer(reader, resync=resync)
         try:
             while True:
-                raw_hdr = await reader.readexactly(HDR.size)
-                magic, version, typ, flags, length = HDR.unpack(raw_hdr)
-                if magic != MAGIC or version != VERSION:
-                    log.error("bad header from %s: magic=%08x version=%d", peer, magic, version)
+                try:
+                    typ, flags, payload = await framer.next_record()
+                except ValueError as exc:
+                    log.error("bad record from %s: %s", peer, exc)
                     break
-                payload = await reader.readexactly(length) if length else b""
 
                 if typ == TYPE_START:
                     if len(payload) != START.size:
@@ -444,6 +528,110 @@ class IngestServer:
                 pass
 
 
+def open_serial(path: str) -> int:
+    """Open the USB CDC device in raw mode; no flow control, no echo."""
+    import termios
+    import tty
+
+    fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        tty.setraw(fd)
+        attrs = termios.tcgetattr(fd)
+        attrs[2] |= termios.CLOCAL | termios.CREAD
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except termios.error:
+        pass
+    return fd
+
+
+def _pump(fd: int, loop, reader: asyncio.StreamReader, stop: threading.Event) -> None:
+    """Move bytes from the tty into the asyncio reader from a helper thread."""
+    try:
+        while not stop.is_set():
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            data = os.read(fd, 8192)
+            if not data:
+                break
+            try:
+                loop.call_soon_threadsafe(reader.feed_data, data)
+            except RuntimeError:
+                return
+    except OSError:
+        pass
+    finally:
+        try:
+            loop.call_soon_threadsafe(reader.feed_eof)
+        except RuntimeError:
+            pass
+
+
+class SerialBytes:
+    """StreamWriter-compatible sink for a raw tty."""
+
+    def __init__(self, fd: int, label: str):
+        self.fd = fd
+        self.label = label
+
+    def write(self, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            try:
+                n = os.write(self.fd, view)
+            except BlockingIOError:
+                select.select([], [self.fd], [], 0.1)
+                continue
+            view = view[n:]
+
+    async def drain(self) -> None:
+        return None
+
+    def get_extra_info(self, name, default=None):
+        return self.label if name == "peername" else default
+
+    def close(self) -> None:
+        return None
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+async def _run_serial(path: str, out_dir: Path) -> None:
+    server = IngestServer(out_dir)
+    server.start_cleanup()
+    loop = asyncio.get_running_loop()
+    log.info("serial: reading %s, writing to %s", path, out_dir)
+    try:
+        while True:
+            try:
+                fd = open_serial(path)
+            except OSError as exc:
+                log.error("serial: open %s failed: %s", path, exc)
+                await asyncio.sleep(RETRY_OPEN_SECONDS)
+                continue
+            log.info("serial: %s open", path)
+            reader = asyncio.StreamReader()
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=_pump, args=(fd, loop, reader, stop), daemon=True
+            )
+            thread.start()
+            try:
+                await server.handle(reader, SerialBytes(fd, path), resync=True)
+            finally:
+                stop.set()
+                thread.join(timeout=1.0)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            log.warning("serial: %s closed; reopening", path)
+            await asyncio.sleep(RETRY_OPEN_SECONDS)
+    finally:
+        await server.stop()
+
+
 async def _list_devices(discovery_port: int, timeout: float) -> None:
     devices = await asyncio.to_thread(list_devices, discovery_port, timeout)
     if not devices:
@@ -498,6 +686,13 @@ def main() -> None:
     parser.add_argument("--port", default=8000, type=int)
     parser.add_argument("--out", default="./recordings", type=Path)
     parser.add_argument(
+        "--serial",
+        default=None,
+        metavar="DEVICE",
+        help="read records from a USB serial device (e.g. /dev/ttyACM0) "
+        "instead of TCP; no discovery is used",
+    )
+    parser.add_argument(
         "--auto-accept",
         nargs="?",
         const="any",
@@ -531,6 +726,9 @@ def main() -> None:
     try:
         if args.list_devices:
             asyncio.run(_list_devices(args.discovery_port, args.discover_timeout))
+            return
+        if args.serial:
+            asyncio.run(_run_serial(args.serial, args.out))
             return
         auto_accept = None if args.no_discovery else args.auto_accept
         if auto_accept is not None and not args.token:

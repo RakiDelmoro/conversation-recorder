@@ -1,5 +1,18 @@
 // User-tunable values. Keep hardware-variant knobs together at the bottom.
 
+/// Link that carries records to the host.
+#[allow(dead_code)] // one variant is selected by `TRANSPORT` at compile time
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// Native USB port (USB-CDC). No Wi-Fi, no discovery.
+    Usb,
+    /// Wi-Fi station plus UDP discovery and the TCP uploader.
+    Tcp,
+}
+
+/// Active transport. Switch to `Tcp` for the wireless path.
+pub const TRANSPORT: Transport = Transport::Usb;
+
 pub const WIFI_SSID: &str = "";
 pub const WIFI_PASSWORD: &str = "";
 /// Optional static receiver. Empty means discover a receiver over UDP.
