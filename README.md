@@ -138,8 +138,10 @@ All build-time settings live in `src/config.rs`.
 | `DISCOVERY_PORT` | `8001` | UDP beacon/offer port |
 | `I2S_RATE` | `48_000` | 48 kHz master image |
 | `I2S_SLAVE` | `true` | XVF3800 drives BCLK/WS |
+| `I2S_BITS` | `16` | Slot width: 16 for v1.0.5 master, 32 for v1.0.9 |
 | `I2S_CHANNEL` | `0` | Routed ASR lane; use `1` for the default right ASR lane |
 | `TEN_VAD_THRESHOLD` | `0.65` | Higher rejects more non-speech |
+| `USE_TEN_VAD` | `true` | Requires `CONFIG_SPIRAM_RODATA` and 240 MHz; disable to use XVF speech energy |
 | `MIN_SPEECH_MS` | `250` | Trigger duration |
 | `PRE_ROLL_MS` | `1_500` | Audio retained before trigger |
 | `HOLDBACK_MS` | `1_500` | Trailing audio queued after speech |
@@ -176,13 +178,19 @@ The array must run an **I2S** firmware image, not the USB image.
 
 | Configuration | Image | Firmware settings |
 |---|---|---|
-| 48 kHz master, XIAO slave | `respeaker_44mm_i2s_c48k2ch_v1.0.0.bin` or `respeaker_xvf3800_i2s_master_v1.0.9_48k.bin` | `I2S_RATE = 48_000`, `I2S_SLAVE = true` |
-| 16 kHz slave | `respeaker_xvf3800_i2s_slave_v1.0.9_16k.bin` | `I2S_RATE = 16_000`, `I2S_SLAVE = false` |
+| 48 kHz master, XIAO slave | `respeaker_44mm_i2s_c48k2ch_v1.0.0.bin` or `respeaker_xvf3800_i2s_master_v1.0.9_48k.bin` | `I2S_RATE = 48_000`, `I2S_SLAVE = true`, `I2S_BITS = 32` |
+| 48 kHz master (old v1.0.5 DFU image) | `respeaker_xvf3800_i2s_master_dfu_firmware_v1.0.5_48k.bin` | `I2S_RATE = 48_000`, `I2S_SLAVE = true`, `I2S_BITS = 16` |
+| 16 kHz slave | `respeaker_xvf3800_i2s_slave_v1.0.9_16k.bin` | `I2S_RATE = 16_000`, `I2S_SLAVE = false`, `I2S_BITS = 32` |
 
 XVF parameters are volatile across reset. The firmware reapplies
 `AEC_ASROUTONOFF=1` and `AUDIO_MGR_OP_L=[7,3]` on every boot. If the routing
 writes are rejected, set `I2S_CHANNEL = 1` to use the firmware's default
 right-channel ASR output.
+
+`DOA_VALUE` moved from command 19 to 18 in I2S firmware v1.0.8. The firmware
+reads the version and selects the matching command, falling back to a probe if
+the version read fails. Firmware older than v1.0.6 has no `DOA_VALUE` command;
+TEN VAD still drives segmentation.
 
 ### Pinout
 
@@ -201,10 +209,13 @@ XVF3800 I2C address: `0x2C`.
 
 ### Speech detection
 
-- TEN VAD runs on 256-sample, 16 ms frames at 16 kHz.
-- The XVF3800 `DOA_VALUE` flag supplies DoA and remains the fallback.
+- TEN VAD runs on 256-sample, 16 ms frames at 16 kHz. Its 302 KB of weights
+  are placed in PSRAM (`CONFIG_SPIRAM_RODATA`) and the CPU runs at 240 MHz;
+  with the weights in 40 MHz DIO flash it needed ~39 ms per 20 ms block.
 - If TEN VAD initialization fails, the recorder falls back to the XVF3800
-  flag. If the XVF3800 I2C link is also unhealthy, an energy VAD is used.
+  `DOA_VALUE` speech flag on firmware v1.0.6+, then to `AEC_SPENERGY_VALUES`,
+  then to an ESP energy VAD.
+- Set `USE_TEN_VAD = false` to bypass the model and use the XVF speech energy.
 
 ### Segmentation
 
@@ -422,8 +433,8 @@ and will pass. This is intentional for this recorder. Tune
 - No TLS or audio encryption.
 - One active receiver per device at a time; a later offer updates the peer for
   the next connection.
-- On-device TEN VAD CPU cost is instrumented but not yet characterized on
-  hardware.
+- TEN VAD only meets the 16 ms budget with its weights in PSRAM and the CPU
+  at 240 MHz. Verify the `TEN VAD: ... us per 20 ms block` log on your build.
 - The XVF3800 must run a matching I2S firmware image.
 
 ## Licensing

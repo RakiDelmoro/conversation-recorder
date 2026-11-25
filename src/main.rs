@@ -121,11 +121,14 @@ fn main() -> Result<()> {
 
     {
         let vad = vad.clone();
+        let recording = recording.clone();
         std::thread::Builder::new()
             .name("xvf".into())
             .stack_size(6 * 1024)
             .spawn(move || {
-                if let Err(e) = xvf3800::task(i2c0, pins.gpio5, pins.gpio6, vad) {
+                if let Err(e) =
+                    xvf3800::task(i2c0, pins.gpio5, pins.gpio6, vad, recording)
+                {
                     error!("XVF3800 task ended: {e}");
                 }
             })?;
