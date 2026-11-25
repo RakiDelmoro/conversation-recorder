@@ -1,27 +1,5 @@
 // User-tunable values. Keep hardware-variant knobs together at the bottom.
 
-/// Link that carries records to the host.
-#[allow(dead_code)] // one variant is selected by `TRANSPORT` at compile time
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
-    /// Native USB port (USB-CDC). No Wi-Fi, no discovery.
-    Usb,
-    /// Wi-Fi station plus UDP discovery and the TCP uploader.
-    Tcp,
-}
-
-/// Active transport. Switch to `Tcp` for the wireless path.
-pub const TRANSPORT: Transport = Transport::Usb;
-
-pub const WIFI_SSID: &str = "";
-pub const WIFI_PASSWORD: &str = "";
-/// Optional static receiver. Empty means discover a receiver over UDP.
-pub const PEER_HOST: &str = "";
-pub const PEER_PORT: u16 = 8000;
-/// Shared secret required in discovery offers. Empty disables discovery.
-pub const PAIRING_TOKEN: &str = "";
-pub const DISCOVERY_PORT: u16 = 8001;
-
 pub const I2S_RATE: u32 = 48_000;
 pub const I2S_SLAVE: bool = true; // XVF3800 drives BCLK/WS
 pub const I2S_BITS: u32 = 16; // v1.0.5 master image uses 16-bit slots; v1.0.9 uses 32

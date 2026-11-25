@@ -12,7 +12,6 @@ use esp_idf_hal::gpio::{Gpio19, Gpio20};
 use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver, USB_SERIAL};
 use log::{info, warn};
 
-use crate::discovery::device_id_bytes;
 use crate::protocol;
 use crate::queue::SharedQueue;
 
@@ -60,7 +59,7 @@ pub fn task(
     // driver's mutex, and a log line can split a record mid-payload.
     unsafe { usb_serial_jtag_vfs_use_driver() };
     let write_timeout = TickType::new_millis(WRITE_TIMEOUT_MS).ticks();
-    let device_id = device_id_bytes();
+    let device_id = device_id();
     let mut frame = [0u8; protocol::HDR_LEN + 3200];
     let mut rx = [0u8; ACK_BUF];
     let mut rx_len = 0usize;
@@ -295,4 +294,21 @@ fn drain_acks(
             return Ok(());
         }
     }
+}
+
+fn device_id() -> [u8; 16] {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut mac = [0u8; 6];
+    unsafe {
+        esp_idf_svc::sys::esp_read_mac(
+            mac.as_mut_ptr(),
+            esp_idf_svc::sys::esp_mac_type_t_ESP_MAC_WIFI_STA,
+        );
+    }
+    let mut id = [0u8; 16];
+    for (i, b) in mac.iter().enumerate() {
+        id[i * 2] = HEX[(b >> 4) as usize];
+        id[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    id
 }

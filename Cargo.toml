@@ -23,11 +23,9 @@ opt-level = "z"
 [dependencies]
 anyhow = "1"
 log = "0.4"
-heapless = "0.9"
 esp-idf-sys = "0.37"
 esp-idf-hal = "0.46"
 esp-idf-svc = "0.52.1"
-embedded-svc = "0.29"
 
 [build-dependencies]
 embuild = "0.33"

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Reference ingest server for the conversation-recorder firmware.
+"""USB CDC ingest server for the conversation-recorder firmware.
 
-Receives START/AUDIO/END records over TCP, or over a USB CDC serial device with
-``--serial``, writes one 16-bit PCM WAV per utterance, and acknowledges
-received sample counts so the device can resume after a link loss.
+Reads START/AUDIO/END records from a raw tty, writes one 16-bit PCM WAV per
+segment, and acknowledges received sample counts so the device can resume
+after a link loss. The ESP-IDF console shares the tty, so the framer resyncs
+past log lines by scanning for the record magic.
 """
 
 import argparse
@@ -11,7 +12,6 @@ import asyncio
 import logging
 import os
 import select
-import socket
 import struct
 import threading
 import time
@@ -64,21 +64,12 @@ def wav_header(rate: int, channels: int, bits: int, data_bytes: int) -> bytes:
     )
 
 
-@dataclass
-class Device:
-    device_id: str
-    state: str
-    queue_bytes: int
-    uptime_ms: int
-    address: Tuple[str, int]
-
-
 class Framer:
     """Splits a byte stream into protocol records.
 
-    With ``resync`` the stream may also carry device console text (the USB
-    transport shares the port with the ESP-IDF log), so sync is recovered by
-    scanning for a plausible record header.
+    With ``resync`` the stream may also carry device console text (USB shares
+    the port with the ESP-IDF log), so sync is recovered by scanning for a
+    plausible record header.
     """
 
     def __init__(self, reader: asyncio.StreamReader, resync: bool = False):
@@ -143,107 +134,6 @@ class Framer:
         return typ, flags, payload
 
 
-def parse_beacon(data: bytes, address: Tuple[str, int]) -> Optional[Device]:
-    try:
-        text = data.decode("ascii", "replace").strip()
-    except UnicodeDecodeError:
-        return None
-    parts = text.split()
-    if len(parts) != 6 or parts[0] != "CREC/1" or parts[1] != "BEACON":
-        return None
-    try:
-        queue_bytes = int(parts[4])
-        uptime_ms = int(parts[5])
-    except ValueError:
-        return None
-    return Device(
-        device_id=parts[2],
-        state=parts[3],
-        queue_bytes=queue_bytes,
-        uptime_ms=uptime_ms,
-        address=address,
-    )
-
-
-def list_devices(discovery_port: int, timeout: float) -> list[Device]:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("", discovery_port))
-    sock.settimeout(0.5)
-    deadline = time.monotonic() + timeout
-    devices: Dict[str, Device] = {}
-    try:
-        while time.monotonic() < deadline:
-            try:
-                data, address = sock.recvfrom(2048)
-            except socket.timeout:
-                continue
-            device = parse_beacon(data, address)
-            if device is not None:
-                devices[device.device_id] = device
-    finally:
-        sock.close()
-    return list(devices.values())
-
-
-def _local_ip_for(remote_ip: str) -> str:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.connect((remote_ip, 1))
-        return sock.getsockname()[0]
-    finally:
-        sock.close()
-
-
-async def offer_loop(
-    target: str,
-    token: str,
-    tcp_port: int,
-    discovery_port: int,
-    advertise_ip: Optional[str],
-) -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("", discovery_port))
-    except OSError as exc:
-        log.error("discovery: cannot bind UDP %d: %s", discovery_port, exc)
-        sock.close()
-        return
-    sock.setblocking(False)
-    loop = asyncio.get_running_loop()
-    log.info(
-        "discovery: listening on UDP %d, offering to %s",
-        discovery_port,
-        target,
-    )
-    try:
-        while True:
-            data, address = await loop.sock_recvfrom(sock, 2048)
-            device = parse_beacon(data, address)
-            if device is None:
-                continue
-            if target not in ("any", device.device_id):
-                continue
-            host_ip = advertise_ip or _local_ip_for(address[0])
-            offer = (
-                f"CREC/1 OFFER {device.device_id} {host_ip} {tcp_port} {token}\n"
-            ).encode("utf-8")
-            try:
-                await loop.sock_sendto(sock, offer, address)
-            except OSError as exc:
-                log.warning("discovery: offer to %s failed: %s", device.device_id, exc)
-                continue
-            log.info(
-                "discovery: offered %s to %s:%d",
-                device.device_id,
-                host_ip,
-                tcp_port,
-            )
-    finally:
-        sock.close()
-
-
 @dataclass
 class Session:
     key: Tuple[str, int]
@@ -267,14 +157,7 @@ class IngestServer:
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.sessions: Dict[Tuple[str, int], Session] = {}
-        self.server: Optional[asyncio.AbstractServer] = None
         self._cleanup_task: Optional[asyncio.Task] = None
-
-    async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
-        self.server = await asyncio.start_server(self.handle, host, port)
-        self.start_cleanup()
-        sock = self.server.sockets[0]
-        return sock.getsockname()[1]
 
     def start_cleanup(self) -> None:
         if self._cleanup_task is None:
@@ -288,10 +171,6 @@ class IngestServer:
             except asyncio.CancelledError:
                 pass
             self._cleanup_task = None
-        if self.server is not None:
-            self.server.close()
-            await self.server.wait_closed()
-            self.server = None
         for session in list(self.sessions.values()):
             if not session.finalized:
                 self._finalize(session)
@@ -325,12 +204,17 @@ class IngestServer:
         session.active = False
         session.finalized = True
         duration = session.received / session.rate if session.rate else 0.0
-        log.info("finalized %s (%.2f s, %d samples)", session.path, duration, session.received)
+        log.info(
+            "finalized %s (%.2f s, %d samples)",
+            session.path,
+            duration,
+            session.received,
+        )
         print(f"{session.path} ({duration:.2f} s)")
 
     async def _send_ack(
         self,
-        writer: asyncio.StreamWriter,
+        writer,
         session_id: int,
         acked_samples: int,
         final: bool = False,
@@ -374,7 +258,9 @@ class IngestServer:
                         device_uptime_ms,
                         device_id_raw,
                     ) = START.unpack(payload)
-                    device = device_id_raw.split(b"\0", 1)[0].decode("ascii", "replace")
+                    device = device_id_raw.split(b"\0", 1)[0].decode(
+                        "ascii", "replace"
+                    )
                     key = (device, session_id)
                     log.info(
                         "START %s session=%08x first=%d rate=%d ch=%d bits=%d uptime=%d",
@@ -449,9 +335,7 @@ class IngestServer:
                         existing.active = True
                         existing.last_activity = time.monotonic()
                         session = existing
-                        log.info(
-                            "resume %s at sample %d", session.path, first_sample
-                        )
+                        log.info("resume %s at sample %d", session.path, first_sample)
 
                     current = session
                     await self._send_ack(writer, session_id, session.received)
@@ -464,7 +348,9 @@ class IngestServer:
                         log.error("AUDIO for inactive session %s", current.key)
                         break
                     if len(payload) % current.sample_bytes != 0:
-                        log.warning("AUDIO payload not sample-aligned: %d bytes", len(payload))
+                        log.warning(
+                            "AUDIO payload not sample-aligned: %d bytes", len(payload)
+                        )
                     current.file.write(payload)
                     current.file.flush()
                     current.received += len(payload) // current.sample_bytes
@@ -632,91 +518,15 @@ async def _run_serial(path: str, out_dir: Path) -> None:
         await server.stop()
 
 
-async def _list_devices(discovery_port: int, timeout: float) -> None:
-    devices = await asyncio.to_thread(list_devices, discovery_port, timeout)
-    if not devices:
-        print("no devices found")
-        return
-    for device in devices:
-        print(
-            f"{device.device_id}  state={device.state}  "
-            f"queue={device.queue_bytes} B  uptime={device.uptime_ms // 1000}s  "
-            f"address={device.address[0]}"
-        )
-
-
-async def _run(
-    host: str,
-    port: int,
-    out_dir: Path,
-    auto_accept: Optional[str],
-    token: str,
-    discovery_port: int,
-    advertise_ip: Optional[str],
-) -> None:
-    server = IngestServer(out_dir)
-    bound = await server.start(host, port)
-    log.info("listening on %s:%d, writing to %s", host, bound, out_dir)
-    offer_task: Optional[asyncio.Task] = None
-    if auto_accept is not None:
-        offer_task = asyncio.create_task(
-            offer_loop(
-                auto_accept,
-                token,
-                bound,
-                discovery_port,
-                advertise_ip,
-            )
-        )
-    try:
-        await asyncio.Event().wait()
-    finally:
-        if offer_task is not None:
-            offer_task.cancel()
-            try:
-                await offer_task
-            except asyncio.CancelledError:
-                pass
-        await server.stop()
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", default=8000, type=int)
-    parser.add_argument("--out", default="./recordings", type=Path)
     parser.add_argument(
         "--serial",
-        default=None,
+        required=True,
         metavar="DEVICE",
-        help="read records from a USB serial device (e.g. /dev/ttyACM0) "
-        "instead of TCP; no discovery is used",
+        help="USB serial device, e.g. /dev/ttyACM0",
     )
-    parser.add_argument(
-        "--auto-accept",
-        nargs="?",
-        const="any",
-        default="any",
-        help="discover devices and offer; 'any' accepts all (default: any)",
-    )
-    parser.add_argument(
-        "--no-discovery",
-        action="store_true",
-        help="disable discovery and wait for a static device",
-    )
-    parser.add_argument(
-        "--list-devices",
-        action="store_true",
-        help="list discovered devices and exit",
-    )
-    parser.add_argument("--discover-timeout", default=5.0, type=float)
-    parser.add_argument("--discovery-port", default=8001, type=int)
-    parser.add_argument("--token", default="")
-    parser.add_argument(
-        "--advertise-ip",
-        default=None,
-        help="IP address to put in offers (default: auto-detect)",
-    )
+    parser.add_argument("--out", default="./recordings", type=Path)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -724,29 +534,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     try:
-        if args.list_devices:
-            asyncio.run(_list_devices(args.discovery_port, args.discover_timeout))
-            return
-        if args.serial:
-            asyncio.run(_run_serial(args.serial, args.out))
-            return
-        auto_accept = None if args.no_discovery else args.auto_accept
-        if auto_accept is not None and not args.token:
-            parser.error(
-                "--token is required for discovery; "
-                "set it to the device PAIRING_TOKEN"
-            )
-        asyncio.run(
-            _run(
-                args.host,
-                args.port,
-                args.out,
-                auto_accept,
-                args.token,
-                args.discovery_port,
-                args.advertise_ip,
-            )
-        )
+        asyncio.run(_run_serial(args.serial, args.out))
     except KeyboardInterrupt:
         pass
 
