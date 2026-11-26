@@ -38,6 +38,7 @@ struct Ctx {
     end_sent: bool,
     end_ack: bool,
     end_attempts: u8,
+    last_progress: Instant,
 }
 
 pub fn task(
@@ -46,6 +47,8 @@ pub fn task(
     d_plus: Gpio20<'static>,
     shared: Arc<SharedQueue>,
     link: Arc<AtomicBool>,
+    acked: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut dev = UsbSerialDriver::new(
         usb,
@@ -70,6 +73,12 @@ pub fn task(
     loop {
         shared.wait(Duration::from_millis(POLL_MS));
 
+        if restart.swap(false, Ordering::Relaxed) {
+            ctx = None;
+            rx_len = 0;
+            retry_at = Instant::now();
+        }
+
         let connected = dev.is_connected();
         link.store(connected, Ordering::Relaxed);
         if connected != linked {
@@ -92,6 +101,8 @@ pub fn task(
                 c.started = false;
                 c.end_sent = false;
                 c.end_ack = false;
+                c.end_attempts = 0;
+                c.last_progress = Instant::now();
             }
             rx_len = 0;
             continue;
@@ -102,13 +113,28 @@ pub fn task(
         }
 
         if let Some(c) = ctx.as_mut() {
-            if let Err(e) = drain_acks(&mut dev, &mut rx, &mut rx_len, c, &shared) {
+            if let Err(e) = drain_acks(&mut dev, &mut rx, &mut rx_len, c, &shared, &acked) {
                 warn!("usb: {e}");
+            }
+            if c.sent > c.acked
+                && c.last_progress.elapsed() >= Duration::from_secs(2)
+            {
+                info!(
+                    "usb: no ACK for session 0x{:08x}; rewinding to sample {}",
+                    c.id, c.acked
+                );
+                c.sent = c.acked;
+                c.started = false;
+                c.end_sent = false;
+                c.end_ack = false;
+                c.end_attempts = 0;
+                c.last_progress = Instant::now();
             }
         }
 
         if ctx.is_none() {
             if let Some(s) = shared.take_start() {
+                acked.store(false, Ordering::Relaxed);
                 ctx = Some(Ctx {
                     id: s.session_id,
                     start_uptime_ms: s.start_uptime_ms,
@@ -118,6 +144,7 @@ pub fn task(
                     end_sent: false,
                     end_ack: false,
                     end_attempts: 0,
+                    last_progress: Instant::now(),
                 });
             }
         }
@@ -206,7 +233,7 @@ pub fn task(
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !c.end_ack && Instant::now() < deadline {
-            if let Err(err) = drain_acks(&mut dev, &mut rx, &mut rx_len, c, &shared) {
+            if let Err(err) = drain_acks(&mut dev, &mut rx, &mut rx_len, c, &shared, &acked) {
                 warn!("usb: {err}");
                 break;
             }
@@ -258,6 +285,7 @@ fn drain_acks(
     rx_len: &mut usize,
     c: &mut Ctx,
     shared: &SharedQueue,
+    acked: &AtomicBool,
 ) -> Result<()> {
     loop {
         let mut read_any = false;
@@ -274,10 +302,15 @@ fn drain_acks(
             match protocol::take_ack(rx, rx_len) {
                 Ok(Some(ack)) => {
                     if ack.session_id == c.id {
+                        let before = c.acked;
                         c.acked = c.acked.max(ack.acked_samples);
+                        if c.acked > before {
+                            c.last_progress = Instant::now();
+                        }
                         shared.ack(c.id, c.acked);
                         if ack.final_ack {
                             c.end_ack = true;
+                            acked.store(true, Ordering::Relaxed);
                         }
                     }
                 }

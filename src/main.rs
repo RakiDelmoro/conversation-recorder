@@ -8,6 +8,7 @@ mod recorder;
 mod ten_vad_model;
 mod usb;
 mod vad;
+mod vadnet;
 mod xvf3800;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +44,8 @@ fn main() -> Result<()> {
     let recording = Arc::new(AtomicBool::new(false));
     let audio_ok = Arc::new(AtomicBool::new(false));
     let usb_link = Arc::new(AtomicBool::new(false));
+    let acked = Arc::new(AtomicBool::new(false));
+    let restart = Arc::new(AtomicBool::new(false));
 
     let mut led = PinDriver::output(pins.gpio21)?;
     led.set_high()?;
@@ -50,11 +53,21 @@ fn main() -> Result<()> {
     {
         let shared = shared.clone();
         let link = usb_link.clone();
+        let acked = acked.clone();
+        let restart = restart.clone();
         std::thread::Builder::new()
             .name("usb".into())
             .stack_size(16 * 1024)
             .spawn(move || {
-                if let Err(e) = usb::task(usb_serial, pins.gpio19, pins.gpio20, shared, link) {
+                if let Err(e) = usb::task(
+                    usb_serial,
+                    pins.gpio19,
+                    pins.gpio20,
+                    shared,
+                    link,
+                    acked,
+                    restart,
+                ) {
                     error!("USB task ended: {e}");
                 }
             })?;
@@ -80,6 +93,8 @@ fn main() -> Result<()> {
         let shared = shared.clone();
         let recording = recording.clone();
         let audio_ok = audio_ok.clone();
+        let acked = acked.clone();
+        let restart = restart.clone();
         std::thread::Builder::new()
             .name("audio".into())
             .stack_size(64 * 1024)
@@ -93,6 +108,8 @@ fn main() -> Result<()> {
                     shared,
                     recording,
                     audio_ok,
+                    acked,
+                    restart,
                 ) {
                     error!("audio task ended: {e}");
                 }

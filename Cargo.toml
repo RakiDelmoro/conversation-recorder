@@ -30,3 +30,7 @@ esp-idf-svc = "0.52.1"
 [build-dependencies]
 embuild = "0.33"
 cc = "1"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["components/vadnet_bridge"]
+remote_component = { name = "espressif/esp-sr", version = "2.6.2" }

@@ -18,9 +18,87 @@ use crate::config;
 use crate::queue::SharedQueue;
 use crate::recorder::Recorder;
 use crate::ten_vad_model::TenVad;
+use crate::vadnet::VadNet;
 use crate::xvf3800::VadState;
 
 const RATE_CHECK_MS: u64 = 2_000;
+
+struct Biquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: f64,
+    x2: f64,
+    y1: f64,
+    y2: f64,
+}
+
+impl Biquad {
+    fn lowpass(fs: f64, fc: f64, q: f64) -> Self {
+        let w0 = 2.0 * std::f64::consts::PI * fc / fs;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: ((1.0 - cos_w0) / 2.0) / a0,
+            b1: (1.0 - cos_w0) / a0,
+            b2: ((1.0 - cos_w0) / 2.0) / a0,
+            a1: (-2.0 * cos_w0) / a0,
+            a2: (1.0 - alpha) / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+/// Sixth-order Butterworth low-pass. Applied before decimation so energy
+/// above 8 kHz cannot fold back into the 16 kHz output, while preserving
+/// more of the 6-7 kHz speech band than the previous 6.5 kHz filter.
+struct LowPass {
+    s1: Biquad,
+    s2: Biquad,
+    s3: Biquad,
+    fs: f64,
+    fc: f64,
+}
+
+impl LowPass {
+    fn new(fs: f64, fc: f64) -> Self {
+        Self {
+            s1: Biquad::lowpass(fs, fc, 0.517_638_09),
+            s2: Biquad::lowpass(fs, fc, 0.707_106_78),
+            s3: Biquad::lowpass(fs, fc, 1.931_851_65),
+            fs,
+            fc,
+        }
+    }
+
+    fn set_rate(&mut self, fs: f64) {
+        if (fs - self.fs).abs() > 1.0 {
+            let fc = self.fc;
+            *self = Self::new(fs, fc);
+        }
+    }
+
+    fn process(&mut self, x: f64) -> f64 {
+        self.s1.process(self.s2.process(self.s3.process(x)))
+    }
+}
 
 pub fn task(
     i2s0: I2S0,
@@ -31,6 +109,8 @@ pub fn task(
     shared: Arc<SharedQueue>,
     recording: Arc<AtomicBool>,
     audio_ok: Arc<AtomicBool>,
+    acked: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
 ) -> Result<()> {
     let bits = match config::I2S_BITS {
         16 => DataBitWidth::Bits16,
@@ -61,7 +141,7 @@ pub fn task(
     i2s.rx_enable()?;
     audio_ok.store(true, Ordering::Relaxed);
 
-    let mut model = if config::USE_TEN_VAD {
+    let mut model = if config::USE_TEN_VAD && !config::ONE_SHOT {
         let model = TenVad::new(config::TEN_VAD_THRESHOLD);
         if model.is_some() {
             info!(
@@ -76,11 +156,22 @@ pub fn task(
         info!("TEN VAD disabled; using XVF3800 speech energy");
         None
     };
-    let mut recorder = Recorder::new(recording, model.is_some())?;
+    let mut recorder = Recorder::new(recording, model.is_some(), acked, restart)?;
+    let mut vadnet = if config::USE_VADNET {
+        let vad = VadNet::new();
+        if vad.is_none() {
+            error!("VADNet init failed; falling back to XVF/energy gate");
+        }
+        vad
+    } else {
+        None
+    };
 
     let mut raw = vec![0u8; (config::I2S_RATE as usize / 50) * frame_bytes];
     let mut mono = [0i16; 960];
-    let mut phase: u8 = 0;
+    let mut input_rate = config::I2S_RATE as f64;
+    let mut lowpass = LowPass::new(input_rate, 7_200.0);
+    let mut resample_t = 0.0f64;
     let mut last_error_log: Option<Instant> = None;
     let mut rate_start: Option<(Instant, u64)> = None;
     let mut rate_checked = false;
@@ -137,8 +228,16 @@ pub fn task(
                         let delta = observed.abs_diff(config::I2S_RATE as u64);
                         if delta * 10 > config::I2S_RATE as u64 {
                             error!(
-                                "I2S rate mismatch: configured {} Hz, observed {} Hz; flash the matching XVF3800 firmware (48k master or 16k slave)",
+                                "I2S rate mismatch: configured {} Hz, observed {} Hz; resampling to 16000 Hz",
                                 config::I2S_RATE,
+                                observed
+                            );
+                        }
+                        if delta * 50 > config::I2S_RATE as u64 {
+                            input_rate = observed as f64;
+                            lowpass.set_rate(input_rate);
+                            info!(
+                                "I2S input measured at {} Hz; resampling to 16000 Hz",
                                 observed
                             );
                         }
@@ -157,19 +256,21 @@ pub fn task(
                 i16::from_le_bytes([raw[o], raw[o + 1]])
             } else {
                 let v = i32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
-                (v >> 16) as i16
+                (v >> 17) as i16
             };
 
-            if config::I2S_RATE == 48_000 {
-                // Band-limited to 16 kHz by the XVF pipeline; decimate by three.
-                if phase == 0 && n_out < mono.len() {
+            let filtered = lowpass.process(s as f64);
+            let s = filtered
+                .round()
+                .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+
+            resample_t += 16_000.0 / input_rate;
+            if resample_t >= 1.0 {
+                resample_t -= 1.0;
+                if n_out < mono.len() {
                     mono[n_out] = s;
                     n_out += 1;
                 }
-                phase = (phase + 1) % 3;
-            } else if n_out < mono.len() {
-                mono[n_out] = s;
-                n_out += 1;
             }
         }
 
@@ -182,7 +283,7 @@ pub fn task(
             if model.is_some() {
                 vad_time_us += started.elapsed().as_micros() as u64;
                 vad_blocks += 1;
-                if vad_blocks >= 100 {
+                if vad_blocks >= 1_500 {
                     info!(
                         "TEN VAD: {} us per 20 ms block ({} blocks)",
                         vad_time_us / vad_blocks as u64,
@@ -192,7 +293,17 @@ pub fn task(
                     vad_blocks = 0;
                 }
             }
-            recorder.process(&mono[..n_out], &vad, &shared, model_probability);
+            let vadnet_speech = match vadnet.as_mut() {
+                Some(v) => v.push(&mono[..n_out]),
+                None => true,
+            };
+            recorder.process(
+                &mono[..n_out],
+                &vad,
+                &shared,
+                model_probability,
+                vadnet_speech,
+            );
         }
     }
 }

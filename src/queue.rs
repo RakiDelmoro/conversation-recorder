@@ -251,6 +251,14 @@ impl SharedQueue {
         }
     }
 
+    pub fn reset(&self) {
+        let mut q = self.inner.lock().unwrap();
+        q.head = 0;
+        q.len = 0;
+        drop(q);
+        self.work.notify_all();
+    }
+
     pub fn bytes(&self) -> usize {
         let q = self.inner.lock().unwrap();
         q.len * size_of::<Slot>()

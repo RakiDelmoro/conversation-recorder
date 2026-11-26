@@ -28,6 +28,6 @@ impl EnergyVad {
         }
         self.noise_dbfs = self.noise_dbfs.clamp(-90.0, -20.0);
 
-        db > self.noise_dbfs + 9.0 && db > -55.0
+        db > self.noise_dbfs + 9.0 && db > -30.0
     }
 }

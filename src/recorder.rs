@@ -13,6 +13,18 @@ use crate::xvf3800::VadState;
 
 const SAMPLE_RATE: u64 = 16_000;
 const MAX_CHUNK: usize = 1600;
+/// Two seconds of 20 ms audio blocks. The start gate uses the ratio of
+/// speech blocks in this window, not consecutive speech.
+const SPEECH_WINDOW_BLOCKS: usize = 100;
+const CANDIDATE_BLOCK: usize = 320; // 20 ms at 16 kHz
+const CANDIDATE_MAX_BLOCKS: usize = 150; // 3 s at 20 ms
+const CANDIDATE_LONG_ACTIVE_MS: u32 = 1_500;
+
+struct CandidateStats {
+    active_ms: u32,
+    zcr: f32,
+    peaks: usize,
+}
 
 enum State {
     Idle,
@@ -26,7 +38,11 @@ pub struct Recorder {
     total_samples: u32,
     window_start_ms: u64,
     speech_run_ms: u32,
+    speech_hist: [bool; SPEECH_WINDOW_BLOCKS],
+    speech_hist_pos: usize,
+    speech_hist_count: usize,
     silence_run_ms: u32,
+    active_speech_ms: u32,
     emit_open: bool,
     pre_roll: Vec<i16>,
     pre_roll_cap: usize,
@@ -40,11 +56,21 @@ pub struct Recorder {
     queue_failed: bool,
     queue_error_logged_ms: i64,
     cooldown_until_ms: i64,
+    one_shot_started: bool,
+    one_shot_done: bool,
+    retry_at_ms: u64,
+    acked: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
     recording: Arc<AtomicBool>,
 }
 
 impl Recorder {
-    pub fn new(recording: Arc<AtomicBool>, use_model: bool) -> anyhow::Result<Box<Self>> {
+    pub fn new(
+        recording: Arc<AtomicBool>,
+        use_model: bool,
+        acked: Arc<AtomicBool>,
+        restart: Arc<AtomicBool>,
+    ) -> anyhow::Result<Box<Self>> {
         let cap = config::PRE_ROLL_MS as usize * 16;
         let mut pre_roll = Vec::new();
         let pre_roll_cap = if pre_roll.try_reserve_exact(cap).is_ok() {
@@ -55,6 +81,10 @@ impl Recorder {
             0
         };
 
+        if config::LOG_ONLY {
+            info!("recorder: LOG_ONLY enabled; candidates are logged but never queued or sent");
+        }
+
         Ok(Box::new(Self {
             state: State::Idle,
             input_samples: 0,
@@ -62,7 +92,11 @@ impl Recorder {
             total_samples: 0,
             window_start_ms: 0,
             speech_run_ms: 0,
+            speech_hist: [false; SPEECH_WINDOW_BLOCKS],
+            speech_hist_pos: 0,
+            speech_hist_count: 0,
             silence_run_ms: 0,
+            active_speech_ms: 0,
             emit_open: false,
             pre_roll,
             pre_roll_cap,
@@ -76,6 +110,11 @@ impl Recorder {
             queue_failed: false,
             queue_error_logged_ms: i64::MIN / 2,
             cooldown_until_ms: 0,
+            one_shot_started: false,
+            one_shot_done: false,
+            retry_at_ms: 0,
+            acked,
+            restart,
             recording,
         }))
     }
@@ -86,14 +125,41 @@ impl Recorder {
         vad: &VadState,
         shared: &SharedQueue,
         model_probability: f32,
+        vadnet_speech: bool,
     ) {
+        if config::ONE_SHOT {
+            self.process_one_shot(pcm, shared);
+            return;
+        }
+
         let snap = vad.snapshot();
+        let xvf_speech = snap.healthy && snap.speech;
         let speech = if self.use_model {
-            model_probability >= config::TEN_VAD_THRESHOLD
-        } else if snap.healthy {
-            snap.speech
+            match &self.state {
+                // A start needs both a strong model score and, when available,
+                // agreement from the XVF3800 speech flag. This keeps claps and
+                // short noise bursts from opening a recording.
+                State::Idle => {
+                    model_probability >= config::TEN_VAD_THRESHOLD
+                        && (!config::REQUIRE_XVF_SPEECH || !snap.healthy || xvf_speech)
+                }
+                // Once active, a lower threshold plus the XVF flag keeps
+                // natural pauses from ending the segment early.
+                State::Active => {
+                    model_probability >= config::TEN_VAD_CONTINUE_THRESHOLD
+                        || (config::REQUIRE_XVF_SPEECH && xvf_speech)
+                }
+            }
         } else {
-            self.energy.process(pcm)
+            // XVF speech is the primary gate, but it can stick on steady
+            // noise. Require the block to also clear the adaptive energy
+            // floor before counting it as speech.
+            let energy_speech = self.energy.process(pcm);
+            if snap.healthy {
+                xvf_speech && energy_speech && vadnet_speech
+            } else {
+                energy_speech && vadnet_speech
+            }
         };
 
         if !self.use_model {
@@ -112,16 +178,53 @@ impl Recorder {
         let now_ms = (self.input_samples as u64 + pcm.len() as u64) * 1000 / SAMPLE_RATE;
 
         if matches!(self.state, State::Idle) {
-            if speech {
-                self.speech_run_ms = self.speech_run_ms.saturating_add(block_ms);
-            } else {
-                self.speech_run_ms = 0;
+            let idx = self.speech_hist_pos;
+            let was = self.speech_hist[idx];
+            if speech && !was {
+                self.speech_hist_count += 1;
+            } else if !speech && was {
+                self.speech_hist_count -= 1;
             }
+            self.speech_hist[idx] = speech;
+            self.speech_hist_pos = (idx + 1) % SPEECH_WINDOW_BLOCKS;
+            self.speech_run_ms = self.speech_hist_count as u32 * block_ms;
 
             if speech
                 && self.speech_run_ms >= config::MIN_SPEECH_MS
                 && now_ms as i64 >= self.cooldown_until_ms
             {
+                let stats = self.candidate_stats();
+                let accepted = stats.active_ms >= config::CANDIDATE_MIN_ACTIVE_MS
+                    && (stats.peaks >= 2 || stats.active_ms >= CANDIDATE_LONG_ACTIVE_MS);
+                info!(
+                    "recorder: candidate check active={} ms, zcr={:.2}, peaks={}, run={} ms, vad={:.2}, xvf={}",
+                    stats.active_ms, stats.zcr, stats.peaks, self.speech_run_ms, model_probability, xvf_speech
+                );
+                if !accepted {
+                    warn!(
+                        "recorder: candidate rejected (active={} ms, zcr={:.2}, peaks={})",
+                        stats.active_ms, stats.zcr, stats.peaks
+                    );
+                    self.reset_speech_window();
+                    self.cooldown_until_ms = now_ms as i64 + 1000;
+                    self.input_samples += pcm.len() as u64;
+                    self.recording.store(false, Ordering::Relaxed);
+                    return;
+                }
+
+                if config::LOG_ONLY {
+                    info!(
+                        "recorder: candidate accepted (log-only) active={} ms, zcr={:.2}, peaks={}, vad={:.2}, run={} ms, xvf={}",
+                        stats.active_ms, stats.zcr, stats.peaks, model_probability, self.speech_run_ms, xvf_speech
+                    );
+                    self.log_simulated_session(stats.active_ms);
+                    self.reset_speech_window();
+                    self.cooldown_until_ms = now_ms as i64 + 1000;
+                    self.input_samples += pcm.len() as u64;
+                    self.recording.store(false, Ordering::Relaxed);
+                    return;
+                }
+
                 let mut id = unsafe { esp_idf_svc::sys::esp_random() };
                 if id == 0 {
                     id = 1;
@@ -135,6 +238,7 @@ impl Recorder {
                     let pre_roll_ms = self.pre_roll_len as u64 * 1000 / SAMPLE_RATE;
                     self.window_start_ms = now_ms.saturating_sub(pre_roll_ms);
                     self.silence_run_ms = 0;
+                    self.active_speech_ms = 0;
                     self.emit_open = true;
                     self.pending_len = 0;
                     self.queue_failed = false;
@@ -143,14 +247,14 @@ impl Recorder {
                         self.recorder_end(1, shared);
                     } else {
                         info!(
-                            "session 0x{:08x} started (doa={})",
-                            self.session_id, snap.doa
+                            "session 0x{:08x} started (doa={}, vad={:.2}, xvf={})",
+                            self.session_id, snap.doa, model_probability, xvf_speech
                         );
                     }
                 } else if now_ms as i64 - self.queue_error_logged_ms >= 1000 {
                     error!("recorder: cannot queue session start");
                     self.queue_error_logged_ms = now_ms as i64;
-                    self.speech_run_ms = 0;
+                    self.reset_speech_window();
                     self.cooldown_until_ms = now_ms as i64 + 1000;
                 }
 
@@ -165,9 +269,14 @@ impl Recorder {
         }
 
         if speech {
-            self.silence_run_ms = 0;
-            self.emit_open = true;
+            self.active_speech_ms = self.active_speech_ms.saturating_add(block_ms);
+            if self.active_speech_ms >= config::SPEECH_RESUME_MS {
+                self.silence_run_ms = 0;
+                self.emit_open = true;
+                self.active_speech_ms = config::SPEECH_RESUME_MS;
+            }
         } else {
+            self.active_speech_ms = 0;
             self.silence_run_ms = self.silence_run_ms.saturating_add(block_ms);
         }
 
@@ -206,6 +315,91 @@ impl Recorder {
             .store(matches!(self.state, State::Active), Ordering::Relaxed);
     }
 
+    fn process_one_shot(&mut self, pcm: &[i16], shared: &SharedQueue) {
+        let len = pcm.len() as u64;
+        let now_ms = (self.input_samples + len) * 1000 / SAMPLE_RATE;
+
+        if self.one_shot_done {
+            if self.acked.load(Ordering::Relaxed) {
+                self.input_samples += len;
+                self.recording.store(false, Ordering::Relaxed);
+                return;
+            }
+            if now_ms >= self.retry_at_ms {
+                warn!(
+                    "recorder: no ACK within {} ms; discarding and restarting",
+                    config::ONE_SHOT_ACK_TIMEOUT_MS
+                );
+                shared.reset();
+                self.restart.store(true, Ordering::Relaxed);
+                self.one_shot_started = false;
+                self.one_shot_done = false;
+                self.retry_at_ms = 0;
+                self.state = State::Idle;
+                self.pending_len = 0;
+                self.emit_open = false;
+                self.total_samples = 0;
+                self.queue_failed = false;
+                self.acked.store(false, Ordering::Relaxed);
+                self.input_samples = 0;
+                self.recording.store(false, Ordering::Relaxed);
+                return;
+            }
+            self.input_samples += len;
+            self.recording.store(false, Ordering::Relaxed);
+            return;
+        }
+
+        if !self.one_shot_started {
+            let mut id = unsafe { esp_idf_svc::sys::esp_random() };
+            if id == 0 {
+                id = 1;
+            }
+            let start_ms = (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1000) as u32;
+            if !shared.push_start(id, start_ms) {
+                if now_ms as i64 - self.queue_error_logged_ms >= 1000 {
+                    error!("recorder: one-shot cannot queue start");
+                    self.queue_error_logged_ms = now_ms as i64;
+                }
+                self.input_samples += len;
+                return;
+            }
+            self.state = State::Active;
+            self.session_id = id;
+            self.total_samples = 0;
+            self.window_start_ms = now_ms;
+            self.pending_len = 0;
+            self.queue_failed = false;
+            self.emit_open = true;
+            self.one_shot_started = true;
+            self.acked.store(false, Ordering::Relaxed);
+            self.recording.store(true, Ordering::Relaxed);
+            info!(
+                "recorder: one-shot session 0x{:08x} started ({} ms)",
+                id, config::ONE_SHOT_MS
+            );
+        }
+
+        if !self.emit_audio(pcm, shared) {
+            self.recorder_end(1, shared);
+            self.one_shot_done = true;
+            self.retry_at_ms = now_ms + config::ONE_SHOT_ACK_TIMEOUT_MS;
+            self.input_samples += len;
+            self.recording.store(false, Ordering::Relaxed);
+            return;
+        }
+
+        if now_ms.saturating_sub(self.window_start_ms) >= config::ONE_SHOT_MS {
+            self.recorder_end(0, shared);
+            self.one_shot_done = true;
+            self.retry_at_ms = now_ms + config::ONE_SHOT_ACK_TIMEOUT_MS;
+            info!("recorder: one-shot session complete");
+        }
+
+        self.input_samples += len;
+        self.recording.store(!self.one_shot_done, Ordering::Relaxed);
+    }
+
     fn push_pre_roll(&mut self, pcm: &[i16]) {
         let cap = self.pre_roll_cap;
         if cap == 0 {
@@ -226,6 +420,121 @@ impl Recorder {
     fn clear_pre_roll(&mut self) {
         self.pre_roll_len = 0;
         self.pre_roll_pos = 0;
+    }
+
+    fn reset_speech_window(&mut self) {
+        self.speech_hist.fill(false);
+        self.speech_hist_pos = 0;
+        self.speech_hist_count = 0;
+        self.speech_run_ms = 0;
+    }
+
+    fn candidate_stats(&self) -> CandidateStats {
+        let cap = self.pre_roll_cap;
+        let total = self.pre_roll_len;
+        if cap == 0 || total < CANDIDATE_BLOCK {
+            return CandidateStats {
+                active_ms: 0,
+                zcr: 1.0,
+                peaks: 0,
+            };
+        }
+
+        let start = if total < cap { 0 } else { self.pre_roll_pos };
+        let blocks = (total / CANDIDATE_BLOCK).min(CANDIDATE_MAX_BLOCKS);
+        let mut rms = [0.0f32; CANDIDATE_MAX_BLOCKS];
+        let mut zcr = [0.0f32; CANDIDATE_MAX_BLOCKS];
+
+        for b in 0..blocks {
+            let base = start + b * CANDIDATE_BLOCK;
+            let mut sum = 0.0f64;
+            let mut crossings = 0u32;
+            let mut prev = 0i16;
+            for j in 0..CANDIDATE_BLOCK {
+                let s = self.pre_roll[(base + j) % cap];
+                let v = s as f64;
+                sum += v * v;
+                if j > 0 && ((s >= 0) != (prev >= 0)) {
+                    crossings += 1;
+                }
+                prev = s;
+            }
+            rms[b] = (sum / CANDIDATE_BLOCK as f64).sqrt() as f32;
+            zcr[b] = crossings as f32 / CANDIDATE_BLOCK as f32;
+        }
+
+        let mut sorted = rms;
+        sorted[..blocks].sort_unstable_by(|a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let floor = sorted[(blocks / 5).min(blocks - 1)];
+        let active_threshold = (floor * 3.0).max(30.0);
+
+        let mut active = 0u32;
+        let mut zcr_sum = 0.0f32;
+        let mut peaks = 0usize;
+        let mut above = false;
+        for b in 0..blocks {
+            let is_active = rms[b] > active_threshold;
+            if is_active {
+                active += 1;
+                zcr_sum += zcr[b];
+            }
+            if is_active && !above {
+                peaks += 1;
+            }
+            above = is_active;
+        }
+
+        let active_ms = active * (CANDIDATE_BLOCK as u32 * 1000 / SAMPLE_RATE as u32);
+        let avg_zcr = if active > 0 {
+            zcr_sum / active as f32
+        } else {
+            1.0
+        };
+        CandidateStats {
+            active_ms,
+            zcr: avg_zcr,
+            peaks,
+        }
+    }
+
+    fn log_simulated_session(&self, active_ms: u32) {
+        let mut id = unsafe { esp_idf_svc::sys::esp_random() };
+        if id == 0 {
+            id = 1;
+        }
+        let pre_roll_samples = self.pre_roll_len as u32;
+        let candidate_samples = active_ms.saturating_mul(16);
+        let total = pre_roll_samples.saturating_add(candidate_samples);
+        info!(
+            "sim: START session=0x{:08x} first=0 rate=16000 ch=1 bits=16 pre_roll={} ms",
+            id,
+            pre_roll_samples as u64 * 1000 / SAMPLE_RATE
+        );
+        info!(
+            "sim: AUDIO session=0x{:08x} first=0 samples={} bytes={}",
+            id,
+            pre_roll_samples,
+            pre_roll_samples * 2
+        );
+        info!(
+            "sim: AUDIO session=0x{:08x} first={} samples={} bytes={}",
+            id,
+            pre_roll_samples,
+            candidate_samples,
+            candidate_samples * 2
+        );
+        info!(
+            "sim: END session=0x{:08x} total={} reason=0",
+            id,
+            total
+        );
+        info!(
+            "sim: ACK session=0x{:08x} acked={} final=true",
+            id,
+            total
+        );
     }
 
     fn emit_pre_roll(&mut self, shared: &SharedQueue) -> bool {
@@ -360,8 +669,9 @@ impl Recorder {
             reason
         );
 
-        self.speech_run_ms = 0;
+        self.reset_speech_window();
         self.silence_run_ms = 0;
+        self.active_speech_ms = 0;
         self.pending_len = 0;
         self.queue_failed = false;
         self.emit_open = false;
