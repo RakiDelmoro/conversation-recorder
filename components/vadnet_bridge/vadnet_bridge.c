@@ -59,8 +59,9 @@ int vadnet_bridge_init(void)
     }
 
     s_iface->set_energy_threshold(s_vad, -40.0f);
-    ESP_LOGI(TAG, "VADNet %s ready: chunk=%d rate=%d", name, s_chunk,
-             s_iface->get_samp_rate(s_vad));
+    ESP_LOGI(TAG, "VADNet %s ready: chunk=%d rate=%d energy=%.1f dBFS", name,
+             s_chunk, s_iface->get_samp_rate(s_vad),
+             s_iface->get_energy_threshold(s_vad));
     return 0;
 }
 

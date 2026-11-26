@@ -294,8 +294,8 @@ pub fn task(
                 }
             }
             let vadnet_speech = match vadnet.as_mut() {
-                Some(v) => v.push(&mono[..n_out]),
-                None => true,
+                Some(v) => Some(v.push(&mono[..n_out])),
+                None => None,
             };
             recorder.process(
                 &mono[..n_out],

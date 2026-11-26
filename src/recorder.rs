@@ -125,7 +125,7 @@ impl Recorder {
         vad: &VadState,
         shared: &SharedQueue,
         model_probability: f32,
-        vadnet_speech: bool,
+        vadnet_speech: Option<bool>,
     ) {
         if config::ONE_SHOT {
             self.process_one_shot(pcm, shared);
@@ -150,15 +150,16 @@ impl Recorder {
                         || (config::REQUIRE_XVF_SPEECH && xvf_speech)
                 }
             }
+        } else if let Some(vadnet) = vadnet_speech {
+            // VADNet is the primary gate when the model is available.
+            vadnet
         } else {
-            // XVF speech is the primary gate, but it can stick on steady
-            // noise. Require the block to also clear the adaptive energy
-            // floor before counting it as speech.
+            // Fallback if the model partition or bridge failed.
             let energy_speech = self.energy.process(pcm);
             if snap.healthy {
-                xvf_speech && energy_speech && vadnet_speech
+                xvf_speech && energy_speech
             } else {
-                energy_speech && vadnet_speech
+                energy_speech
             }
         };
 
