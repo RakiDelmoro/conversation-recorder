@@ -46,6 +46,7 @@ fn main() -> Result<()> {
     let usb_link = Arc::new(AtomicBool::new(false));
     let acked = Arc::new(AtomicBool::new(false));
     let restart = Arc::new(AtomicBool::new(false));
+    let speech_active = Arc::new(AtomicBool::new(false));
 
     let mut led = PinDriver::output(pins.gpio21)?;
     led.set_high()?;
@@ -75,13 +76,13 @@ fn main() -> Result<()> {
 
     {
         let vad = vad.clone();
-        let recording = recording.clone();
+        let speech_active = speech_active.clone();
         std::thread::Builder::new()
             .name("xvf".into())
             .stack_size(6 * 1024)
             .spawn(move || {
                 if let Err(e) =
-                    xvf3800::task(i2c0, pins.gpio5, pins.gpio6, vad, recording)
+                    xvf3800::task(i2c0, pins.gpio5, pins.gpio6, vad, speech_active)
                 {
                     error!("XVF3800 task ended: {e}");
                 }
@@ -95,6 +96,7 @@ fn main() -> Result<()> {
         let audio_ok = audio_ok.clone();
         let acked = acked.clone();
         let restart = restart.clone();
+        let speech_active = speech_active.clone();
         std::thread::Builder::new()
             .name("audio".into())
             .stack_size(64 * 1024)
@@ -110,6 +112,7 @@ fn main() -> Result<()> {
                     audio_ok,
                     acked,
                     restart,
+                    speech_active,
                 ) {
                     error!("audio task ended: {e}");
                 }

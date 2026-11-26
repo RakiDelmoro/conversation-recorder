@@ -62,6 +62,7 @@ pub struct Recorder {
     acked: Arc<AtomicBool>,
     restart: Arc<AtomicBool>,
     recording: Arc<AtomicBool>,
+    speech_active: Arc<AtomicBool>,
 }
 
 impl Recorder {
@@ -70,6 +71,7 @@ impl Recorder {
         use_model: bool,
         acked: Arc<AtomicBool>,
         restart: Arc<AtomicBool>,
+        speech_active: Arc<AtomicBool>,
     ) -> anyhow::Result<Box<Self>> {
         let cap = config::PRE_ROLL_MS as usize * 16;
         let mut pre_roll = Vec::new();
@@ -116,6 +118,7 @@ impl Recorder {
             acked,
             restart,
             recording,
+            speech_active,
         }))
     }
 
@@ -162,6 +165,8 @@ impl Recorder {
                 energy_speech
             }
         };
+
+        self.speech_active.store(speech, Ordering::Relaxed);
 
         if !self.use_model {
             if !snap.healthy && !self.degraded {
@@ -319,6 +324,8 @@ impl Recorder {
     fn process_one_shot(&mut self, pcm: &[i16], shared: &SharedQueue) {
         let len = pcm.len() as u64;
         let now_ms = (self.input_samples + len) * 1000 / SAMPLE_RATE;
+        self.speech_active
+            .store(!self.one_shot_done, Ordering::Relaxed);
 
         if self.one_shot_done {
             if self.acked.load(Ordering::Relaxed) {

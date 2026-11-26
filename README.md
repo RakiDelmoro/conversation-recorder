@@ -270,10 +270,14 @@ boundary. The first segment's cap includes the pre-roll window.
 | Recording | Solid on |
 | Idle | 20 ms on / 2000 ms period |
 
-The LED follows the open/closed segment, not instantaneous speech. It stays
-solid through the 60 s silence wait and turns off when `END` is queued.
+The XIAO status LED follows the open/closed segment, not instantaneous speech. It
+stays solid through the 60 s silence wait and turns off when `END` is queued.
 
-The LED turns on only after the recorder has confirmed a segment start, i.e.
+The XVF3800 LED ring is separate: it is off while VADNet reports non-speech and
+solid green while VADNet reports speech. The XVF DoA animation is disabled, so
+the ring no longer reacts to every sound independently of the recorder.
+
+The XIAO LED turns on only after the recorder has confirmed a segment start, i.e.
 after `MIN_SPEECH_MS` of speech that passed the start gate. A short clap or
 noise burst does not light it.
 

@@ -130,14 +130,27 @@ fn read_version(i2c: &mut I2cDriver) -> Result<[u8; 3]> {
 
 const LED_RESID: u8 = 20;
 const LED_EFFECT_CMD: u8 = 12;
-const LED_DOA_COLOR_CMD: u8 = 17;
-const LED_EFFECT_DOA: u8 = 4;
+const LED_COLOR_CMD: u8 = 16;
+const LED_EFFECT_OFF: u8 = 0;
+const LED_EFFECT_SINGLE: u8 = 3;
+const LED_ON_COLOR: u32 = 0x00FF00;
 
-fn set_led_doa_color(i2c: &mut I2cDriver, base: u32, doa: u32) -> Result<()> {
-    let mut data = [0u8; 8];
-    data[..4].copy_from_slice(&base.to_le_bytes());
-    data[4..].copy_from_slice(&doa.to_le_bytes());
-    xvf_write(i2c, LED_RESID, LED_DOA_COLOR_CMD, &data)
+fn set_led_ring(i2c: &mut I2cDriver, active: bool) -> Result<()> {
+    let effect = if active {
+        LED_EFFECT_SINGLE
+    } else {
+        LED_EFFECT_OFF
+    };
+    xvf_write(i2c, LED_RESID, LED_EFFECT_CMD, &[effect])?;
+    if active {
+        xvf_write(
+            i2c,
+            LED_RESID,
+            LED_COLOR_CMD,
+            &LED_ON_COLOR.to_le_bytes(),
+        )?;
+    }
+    Ok(())
 }
 
 const AEC_RESID: u8 = 33;
@@ -169,10 +182,21 @@ pub fn task(
     sda: Gpio5,
     scl: Gpio6,
     state: Arc<VadState>,
-    recording: Arc<AtomicBool>,
+    speech_active: Arc<AtomicBool>,
 ) -> Result<()> {
     let cfg = I2cConfig::new().baudrate(Hertz(100_000));
     let mut i2c = I2cDriver::new(i2c0, sda, scl, &cfg)?;
+
+    let mut led_ok = match set_led_ring(&mut i2c, false) {
+        Ok(()) => {
+            info!("XVF3800 LED ring: off until VADNet speech");
+            true
+        }
+        Err(e) => {
+            warn!("XVF3800 LED ring setup failed: {e}");
+            false
+        }
+    };
 
     let version = match read_version(&mut i2c) {
         Ok(version) => {
@@ -242,23 +266,6 @@ pub fn task(
         state.polls.fetch_add(1, Ordering::Relaxed);
     }
 
-    let mut led_ok = match xvf_write(
-        &mut i2c,
-        LED_RESID,
-        LED_EFFECT_CMD,
-        &[LED_EFFECT_DOA],
-    )
-    .and_then(|_| set_led_doa_color(&mut i2c, 0x000020, 0x00FFFF))
-    {
-        Ok(()) => {
-            info!("XVF3800 LED ring: DoA effect (blue idle, green recording)");
-            true
-        }
-        Err(e) => {
-            warn!("XVF3800 LED ring setup failed: {e}");
-            false
-        }
-    };
     let mut energy = [0f32; 4];
     let mut speech_via_energy = if doa_cmd.is_none() {
         match read_speech_energy(&mut i2c, &mut energy) {
@@ -279,7 +286,8 @@ pub fn task(
     } else {
         false
     };
-    let mut led_recording = recording.load(Ordering::Relaxed);
+    let mut led_active = false;
+    let mut last_led_retry = Instant::now();
 
     let mut last_doa_log: Option<Instant> = None;
     let mut last_poll_error_log: Option<Instant> = None;
@@ -344,16 +352,27 @@ pub fn task(
             }
         }
 
-        let rec = recording.load(Ordering::Relaxed);
-        if rec != led_recording {
+        let active = speech_active.load(Ordering::Relaxed);
+        if active != led_active {
             if led_ok {
-                let base = if rec { 0x002000 } else { 0x000020 };
-                if let Err(e) = set_led_doa_color(&mut i2c, base, 0x00FFFF) {
-                    warn!("XVF3800 LED update failed: {e}");
-                    led_ok = false;
+                match set_led_ring(&mut i2c, active) {
+                    Ok(()) => {
+                        led_active = active;
+                        info!("XVF3800 LED ring: {}", if active { "on" } else { "off" });
+                    }
+                    Err(e) => {
+                        warn!("XVF3800 LED update failed: {e}");
+                        led_ok = false;
+                        last_led_retry = Instant::now();
+                    }
                 }
             }
-            led_recording = rec;
+        } else if !led_ok && last_led_retry.elapsed() >= Duration::from_secs(1) {
+            if set_led_ring(&mut i2c, led_active).is_ok() {
+                info!("XVF3800 LED ring control recovered");
+                led_ok = true;
+            }
+            last_led_retry = Instant::now();
         }
 
         if !routing_ok && last_routing_retry.elapsed() >= Duration::from_secs(1) {

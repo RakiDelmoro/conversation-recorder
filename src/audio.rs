@@ -111,6 +111,7 @@ pub fn task(
     audio_ok: Arc<AtomicBool>,
     acked: Arc<AtomicBool>,
     restart: Arc<AtomicBool>,
+    speech_active: Arc<AtomicBool>,
 ) -> Result<()> {
     let bits = match config::I2S_BITS {
         16 => DataBitWidth::Bits16,
@@ -156,7 +157,7 @@ pub fn task(
         info!("TEN VAD disabled; using XVF3800 speech energy");
         None
     };
-    let mut recorder = Recorder::new(recording, model.is_some(), acked, restart)?;
+    let mut recorder = Recorder::new(recording, model.is_some(), acked, restart, speech_active)?;
     let mut vadnet = if config::USE_VADNET {
         let vad = VadNet::new();
         if vad.is_none() {
