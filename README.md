@@ -25,8 +25,8 @@ flowchart LR
 Data path:
 
 1. The XVF3800 provides a 48 kHz, 32-bit stereo I2S stream.
-2. The audio task extracts channel 0, converts to 16-bit mono, and decimates
-   48 kHz to 16 kHz.
+2. The audio task extracts channel 0, converts to 16-bit mono, and resamples
+   the measured input rate to 16 kHz.
 3. TEN VAD classifies 256-sample (16 ms) frames.
 4. The recorder applies pre-roll, minimum-speech, holdback, and segment-cap
    rules, then queues `START`/`AUDIO`/`END` records.
@@ -39,7 +39,7 @@ Data path:
 | Path | Purpose |
 |---|---|
 | `src/main.rs` | Peripheral setup, thread wiring, status loop |
-| `src/audio.rs` | I2S capture, channel extraction, 48→16 kHz decimation |
+| `src/audio.rs` | I2S capture, channel extraction, measured-rate resampling to 16 kHz |
 | `src/recorder.rs` | Segmentation state machine and queue producer |
 | `src/queue.rs` | Fixed-slot PSRAM ring with ACK-driven reclamation |
 | `src/usb.rs` | USB CDC transport and ACK/resume logic |
@@ -48,8 +48,9 @@ Data path:
 | `src/ten_vad/` | Vendored TEN VAD C front end and model inference |
 | `src/protocol.rs` | Wire record encoding/decoding and ACK parser |
 | `src/config.rs` | Build-time configuration |
-| `tools/ingest_server.py` | USB serial receiver and WAV writer |
-| `tools/test_ingest_server.py` | USB serial integration tests |
+| `audio-receiver/receiver.py` | USB serial receiver, WAV writer, and ACKs |
+| `audio-receiver/test_receiver.py` | USB serial integration tests |
+| `audio-receiver/README.md` | Host receiver usage |
 | `tools/export_ten_vad_weights.py` | Regenerates the C weight header from ONNX |
 
 ## Prerequisites
@@ -122,35 +123,46 @@ All build-time settings live in `src/config.rs`.
 | `I2S_SLAVE` | `true` | XVF3800 drives BCLK/WS |
 | `I2S_BITS` | `16` | Slot width: 16 for v1.0.5 master, 32 for v1.0.9 |
 | `I2S_CHANNEL` | `0` | Routed ASR lane; use `1` for the default right ASR lane |
-| `TEN_VAD_THRESHOLD` | `0.65` | Higher rejects more non-speech |
-| `USE_TEN_VAD` | `true` | Requires `CONFIG_SPIRAM_RODATA` and 240 MHz; disable to use XVF speech energy |
-| `MIN_SPEECH_MS` | `250` | Trigger duration |
-| `PRE_ROLL_MS` | `1_500` | Audio retained before trigger |
+| `TEN_VAD_THRESHOLD` | `0.35` | Start threshold; higher rejects more non-speech |
+| `TEN_VAD_CONTINUE_THRESHOLD` | `0.20` | Keepalive threshold once a segment is active |
+| `REQUIRE_XVF_SPEECH` | `false` | Require XVF speech agreement to start when the XVF is healthy; leave off for v1.0.5 |
+| `USE_TEN_VAD` | `false` | Use XVF3800 speech flag/DoA; enable for TEN VAD |
+| `MIN_SPEECH_MS` | `600` | Speech required in the rolling 2 s window |
+| `PRE_ROLL_MS` | `3_000` | Audio retained before trigger |
+| `LOG_ONLY` | `false` | Set `true` for log-only simulation; `false` sends audio |
 | `HOLDBACK_MS` | `1_500` | Trailing audio queued after speech |
-| `SILENCE_TIMEOUT_MS` | `3_000` | Segment ends after this much silence |
-| `SEGMENT_MS` | `60_000` | Hard cap for continuous speech |
+| `SILENCE_TIMEOUT_MS` | `60_000` | Conversation ends after this much silence |
+| `SEGMENT_MS` | `1_800_000` | Hard cap for continuous speech |
+| `ONE_SHOT` | `false` | One-shot test mode; false uses VAD segmentation |
+| `ONE_SHOT_MS` | `60_000` | One-shot capture duration |
 | `QUEUE_BYTES` | `4 MB` | Unacknowledged audio buffer |
 
 ## Flash
 
 Stop the serial receiver before flashing; it holds the USB tty open.
 
+The VADNet build uses a custom partition table and a model partition.
+`espflash flash` writes its own default partition table at `0x8000`, so
+write the custom table **last**:
+
 ```sh
 espflash flash --monitor --chip esp32s3 \
   target/xtensa-esp32s3-espidf/release/conversation-recorder
+espflash write-bin 0x400000 firmware-assets/srmodels.bin --chip esp32s3
+espflash write-bin 0x8000 firmware-assets/partition-table.bin --chip esp32s3
 ```
+
+The table must define `factory` at `0x10000` (4 MB) and `model` at
+`0x400000` (3 MB).
 
 Expected boot and runtime logs:
 
 ```text
-XVF3800 firmware v...
+XVF3800 firmware v1.0.9
 I2S configured 48000 Hz, observed 4799x Hz
-XVF3800 ASR route L=[7,3], ASROUTONOFF=1
-TEN VAD model ready (threshold 0.65)
+XVF3800 DOA_VALUE read via cmd 18
+vadnet: VADNet vadnet1_medium ready: chunk=... rate=16000
 usb: host attached
-usb: session 0x........ started at sample 0
-usb: session 0x........ ended at ... samples
-TEN VAD: ... us per 20 ms block (...)
 ```
 
 Under WSL2, attach the USB device before starting the receiver:
@@ -203,6 +215,19 @@ XVF3800 I2C address: `0x2C`.
 - TEN VAD runs on 256-sample, 16 ms frames at 16 kHz. Its 302 KB of weights
   are placed in PSRAM (`CONFIG_SPIRAM_RODATA`) and the CPU runs at 240 MHz;
   with the weights in 40 MHz DIO flash it needed ~39 ms per 20 ms block.
+- A segment is committed after 600 ms of speech in a rolling 2 s window. Short
+  gaps do not reset the window, so normal speech with plosives and pauses still
+  triggers while a clap does not. The 3 s pre-roll is the candidate buffer: it
+  captures audio before the commit point, so the first word is not lost.
+- Before sending, the candidate pre-roll is checked for active duration and
+  envelope peaks. A clap/short transient is rejected on-device and never
+  queued; the LED stays in its idle pattern.
+- When the XVF3800 is healthy and `REQUIRE_XVF_SPEECH` is set, its speech flag
+  must agree with TEN VAD before a segment starts. If the XVF is unavailable,
+  TEN VAD decides alone.
+- The task measures the actual I2S rate over the first two seconds and
+  resamples that rate to 16 kHz. A nominal 48 kHz stream is still resampled
+  with the same fractional phase accumulator.
 - If TEN VAD initialization fails, the recorder falls back to the XVF3800
   `DOA_VALUE` speech flag on firmware v1.0.6+, then to `AEC_SPENERGY_VALUES`,
   then to an ESP energy VAD.
@@ -212,15 +237,15 @@ XVF3800 I2C address: `0x2C`.
 
 | Event | Behavior |
 |---|---|
-| 250 ms sustained speech | Start segment; flush 1.5 s pre-roll |
+| 600 ms speech in a 2 s window | Commit segment; flush 3 s pre-roll |
 | Speech stops | Queue 1.5 s holdback |
-| 3 s of silence | End segment (`reason 0`) |
-| Pause < 3 s | Same segment |
-| Pause > 3 s | Next speech starts a new segment |
-| 60 s cap | Rotate to a new segment without stopping capture (`reason 2`) |
+| 60 s of silence | End segment (`reason 0`) |
+| Pause < 60 s | Same segment |
+| Pause > 60 s | Next speech starts a new segment |
+| 30 min cap | Rotate to a new segment without stopping capture (`reason 2`) |
 | Queue overflow | End segment (`reason 1`) |
 
-Continuous speech rotates at 60 s by queueing `END` for the finished segment
+Continuous speech rotates at 30 min by queueing `END` for the finished segment
 and `START` for the next one. No audio is duplicated or dropped at the
 boundary. The first segment's cap includes the pre-roll window.
 
@@ -245,18 +270,33 @@ boundary. The first segment's cap includes the pre-roll window.
 | Recording | Solid on |
 | Idle | 20 ms on / 2000 ms period |
 
+The LED follows the open/closed segment, not instantaneous speech. It stays
+solid through the 60 s silence wait and turns off when `END` is queued.
+
+The LED turns on only after the recorder has confirmed a segment start, i.e.
+after `MIN_SPEECH_MS` of speech that passed the start gate. A short clap or
+noise burst does not light it.
+
 ## USB transport
 
 The device enumerates as a USB CDC serial device and streams the same records
 used by the previous TCP path. On the host:
 
 ```sh
-python3 tools/ingest_server.py --serial /dev/ttyACM0 --out recordings
+python3 audio-receiver/receiver.py --serial /dev/ttyACM0 --out recordings
+```
+
+On Windows, install pyserial and use the COM port:
+
+```powershell
+python -m pip install -r audio-receiver\requirements.txt
+python audio-receiver\receiver.py --serial COM3 --out recordings
 ```
 
 Behavior:
 
-- Opens the tty raw, no echo, no flow control.
+- Opens the port raw on POSIX or via pyserial on Windows; no echo or flow
+  control.
 - Writes one 16 kHz mono s16le WAV per segment.
 - Sends ACKs back over the same tty after each `AUDIO` record and after `END`.
 - The ESP-IDF console shares the port. The receiver resyncs past log text by
@@ -323,7 +363,7 @@ cargo build --release
 USB ingest tests:
 
 ```sh
-python3 tools/test_ingest_server.py -v
+python3 audio-receiver/test_receiver.py -v
 ```
 
 The tests use a PTY to cover START/AUDIO/END ingestion, WAV correctness,
