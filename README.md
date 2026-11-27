@@ -130,12 +130,7 @@ All build-time settings live in `src/config.rs`.
 | `SPEECH_RESUME_MS` | `300` | Speech required to reset the silence timer |
 | `SILENCE_TIMEOUT_MS` | `60_000` | Segment ends after this much silence |
 | `SEGMENT_MS` | `1_800_000` | Hard cap for continuous speech |
-| `RING_SPEECH_HOLD_MS` | `400` | Keep the ring blue this long after speech stops |
-| `RING_LEVEL_MIN_DBFS` | `-50.0` | Lower end of the speech-level-to-brightness map |
-| `RING_LEVEL_MAX_DBFS` | `-12.0` | Upper end of the speech-level-to-brightness map |
-| `RING_LEVEL_FLOOR` | `40` | Minimum ring brightness while speech is active |
-| `RING_LEVEL_RELEASE` | `0.80` | Per-10 ms brightness decay when the level falls |
-| `RING_HOLD_BRIGHTNESS` | `128` | Green hold-state brightness |
+| `RING_SPEECH_HOLD_MS` | `400` | Keep the blue DoA ring this long after speech stops |
 | `QUEUE_BYTES` | `4 MB` | Unacknowledged audio buffer |
 | `ONE_SHOT` | `false` | One-shot capture mode; disables VAD segmentation |
 | `ONE_SHOT_MS` | `60_000` | One-shot capture duration |
@@ -276,17 +271,15 @@ The XVF3800 LED ring reflects the recorder's session state:
 
 | Ring | Meaning |
 |---|---|
-| Off | No session open |
-| Pulsing blue (VU) | Session committed; speech is being recorded |
-| Solid green | Session still open, waiting for more speech (up to 60 s) |
+| Off | No session open, or silence hold |
+| Blue DoA segment | Session committed; speech is being recorded |
 
-While VADNet reports speech, blue brightness tracks the microphone RMS level
-with a fast attack and `RING_LEVEL_RELEASE` decay. This is amplitude, not
-VADNet confidence: the model returns only speech/non-speech. The XVF task polls
-every 50 ms and writes brightness only when it changes. After
-`RING_SPEECH_HOLD_MS` (400 ms) without speech, the ring switches to solid green
-and stays green through the 60 s silence timeout until `END`. Rejected
-candidates do not light the ring.
+While VADNet reports speech, the ring runs the XVF DoA effect with a black base
+color and a blue direction color. Only the LEDs for the current sound direction
+light. This is the XVF's internal DoA rendering; the ESP32 does not read the
+angle. After `RING_SPEECH_HOLD_MS` (400 ms) without speech, the ring turns off
+and stays off through the 60 s silence timeout until `END`. The XIAO LED remains
+on during that hold. Rejected candidates do not light the ring.
 
 The ring reaches blue about 0.6–0.7 s after speech onset: the commit needs
 `MIN_SPEECH_MS` (600 ms), plus an audio block and the XVF task's 50 ms poll.

@@ -1,6 +1,6 @@
 //! I2S capture from the XVF3800 and 48 kHz -> 16 kHz decimation.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -75,44 +75,6 @@ struct LowPass {
     fc: f64,
 }
 
-/// Maps the speech envelope to an LED brightness with fast attack and a slow
-/// release, so the ring pulses with speech instead of flickering per block.
-struct LevelMeter {
-    env: f32,
-}
-
-impl LevelMeter {
-    fn new() -> Self {
-        Self { env: 0.0 }
-    }
-
-    fn process(&mut self, pcm: &[i16]) -> u8 {
-        if pcm.is_empty() {
-            return config::RING_LEVEL_FLOOR;
-        }
-        let mut sum = 0.0f64;
-        for &s in pcm {
-            let v = s as f64;
-            sum += v * v;
-        }
-        let rms = (sum / pcm.len() as f64).sqrt();
-        let db = 20.0 * (rms / 32768.0).max(1e-9).log10() as f32;
-        let span = config::RING_LEVEL_MAX_DBFS - config::RING_LEVEL_MIN_DBFS;
-        let target =
-            ((db - config::RING_LEVEL_MIN_DBFS) / span).clamp(0.0, 1.0);
-        self.env = if target > self.env {
-            target
-        } else {
-            self.env * config::RING_LEVEL_RELEASE
-        };
-        let floor = config::RING_LEVEL_FLOOR as f32;
-        let ceil = config::RING_LEVEL_CEIL as f32;
-        (floor + self.env * (ceil - floor))
-            .round()
-            .clamp(0.0, 255.0) as u8
-    }
-}
-
 impl LowPass {
     fn new(fs: f64, fc: f64) -> Self {
         Self {
@@ -147,7 +109,6 @@ pub fn task(
     acked: Arc<AtomicBool>,
     restart: Arc<AtomicBool>,
     ring_speech: Arc<AtomicBool>,
-    ring_level: Arc<AtomicU8>,
 ) -> Result<()> {
     let mut vadnet = match VadNet::new() {
         Some(vad) => vad,
@@ -191,7 +152,6 @@ pub fn task(
     let mut mono = [0i16; 960];
     let mut input_rate = config::I2S_RATE as f64;
     let mut lowpass = LowPass::new(input_rate, 7_200.0);
-    let mut meter = LevelMeter::new();
     let mut resample_t = 0.0f64;
     let mut last_error_log: Option<Instant> = None;
     let mut rate_start: Option<(Instant, u64)> = None;
@@ -294,7 +254,6 @@ pub fn task(
         }
 
         if n_out > 0 {
-            ring_level.store(meter.process(&mono[..n_out]), Ordering::Relaxed);
             let vadnet_speech = vadnet.push(&mono[..n_out]);
             recorder.process(&mono[..n_out], &shared, vadnet_speech);
         }

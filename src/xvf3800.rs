@@ -1,6 +1,6 @@
 //! XVF3800 control over I2C: boot routing and LED ring.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -77,15 +77,11 @@ fn read_version(i2c: &mut I2cDriver) -> Result<[u8; 3]> {
 
 const LED_RESID: u8 = 20;
 const LED_EFFECT_CMD: u8 = 12;
-const LED_BRIGHTNESS_CMD: u8 = 13;
-const LED_COLOR_CMD: u8 = 16;
+const LED_DOA_COLOR_CMD: u8 = 17;
 const LED_EFFECT_OFF: u8 = 0;
-const LED_EFFECT_SOLID: u8 = 3;
-const LED_SPEECH_COLOR: u32 = 0x0000FF;
-const LED_HOLD_COLOR: u32 = 0x00FF00;
-/// Minimum brightness change before another I2C write while speech is active.
-const LED_LEVEL_STEP: u8 = 4;
-const LED_LEVEL_INTERVAL: Duration = Duration::from_millis(100);
+const LED_EFFECT_DOA: u8 = 4;
+const LED_DOA_BASE_COLOR: u32 = 0x000000;
+const LED_DOA_SPEECH_COLOR: u32 = 0x0000FF;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RingMode {
@@ -98,30 +94,22 @@ impl RingMode {
     fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Speech => "pulsing blue (speech)",
-            Self::Hold => "solid green (hold)",
+            Self::Speech => "blue direction (speech)",
+            Self::Hold => "off (silence hold)",
         }
     }
 }
 
-fn set_led_brightness(i2c: &mut I2cDriver, brightness: u8) -> Result<()> {
-    xvf_write(i2c, LED_RESID, LED_BRIGHTNESS_CMD, &[brightness])
-}
-
-fn set_led_ring(i2c: &mut I2cDriver, mode: RingMode, brightness: u8) -> Result<()> {
-    if mode == RingMode::Off {
+fn set_led_ring(i2c: &mut I2cDriver, mode: RingMode) -> Result<()> {
+    if mode != RingMode::Speech {
         xvf_write(i2c, LED_RESID, LED_EFFECT_CMD, &[LED_EFFECT_OFF])?;
         return Ok(());
     }
-    let color = match mode {
-        RingMode::Speech => LED_SPEECH_COLOR,
-        _ => LED_HOLD_COLOR,
-    };
-    // Set colour and brightness before starting the effect so the old look is
-    // never visible under the new state.
-    xvf_write(i2c, LED_RESID, LED_COLOR_CMD, &color.to_le_bytes())?;
-    set_led_brightness(i2c, brightness)?;
-    xvf_write(i2c, LED_RESID, LED_EFFECT_CMD, &[LED_EFFECT_SOLID])?;
+    let mut data = [0u8; 8];
+    data[..4].copy_from_slice(&LED_DOA_BASE_COLOR.to_le_bytes());
+    data[4..].copy_from_slice(&LED_DOA_SPEECH_COLOR.to_le_bytes());
+    xvf_write(i2c, LED_RESID, LED_DOA_COLOR_CMD, &data)?;
+    xvf_write(i2c, LED_RESID, LED_EFFECT_CMD, &[LED_EFFECT_DOA])?;
     Ok(())
 }
 
@@ -142,12 +130,11 @@ pub fn task(
     scl: Gpio6,
     recording: Arc<AtomicBool>,
     ring_speech: Arc<AtomicBool>,
-    ring_level: Arc<AtomicU8>,
 ) -> Result<()> {
     let cfg = I2cConfig::new().baudrate(Hertz(100_000));
     let mut i2c = I2cDriver::new(i2c0, sda, scl, &cfg)?;
 
-    let mut led_ok = match set_led_ring(&mut i2c, RingMode::Off, 0) {
+    let mut led_ok = match set_led_ring(&mut i2c, RingMode::Off) {
         Ok(()) => {
             info!("XVF3800 LED ring: off until recording");
             true
@@ -178,8 +165,6 @@ pub fn task(
     };
 
     let mut led_mode = RingMode::Off;
-    let mut led_level = 0u8;
-    let mut last_level_write = Instant::now();
     let mut last_led_retry = Instant::now();
     let mut last_routing_retry = Instant::now();
 
@@ -193,19 +178,12 @@ pub fn task(
         } else {
             RingMode::Off
         };
-        let brightness = match mode {
-            RingMode::Off => 0,
-            RingMode::Speech => ring_level.load(Ordering::Relaxed).max(config::RING_LEVEL_FLOOR),
-            RingMode::Hold => config::RING_HOLD_BRIGHTNESS,
-        };
 
         if mode != led_mode {
             if led_ok {
-                match set_led_ring(&mut i2c, mode, brightness) {
+                match set_led_ring(&mut i2c, mode) {
                     Ok(()) => {
                         led_mode = mode;
-                        led_level = brightness;
-                        last_level_write = Instant::now();
                         info!("XVF3800 LED ring: {}", mode.label());
                     }
                     Err(e) => {
@@ -219,30 +197,11 @@ pub fn task(
                 led_mode = mode;
             }
         } else if !led_ok && last_led_retry.elapsed() >= Duration::from_secs(1) {
-            if set_led_ring(&mut i2c, led_mode, brightness).is_ok() {
+            if set_led_ring(&mut i2c, led_mode).is_ok() {
                 info!("XVF3800 LED ring control recovered");
                 led_ok = true;
-                led_level = brightness;
-                last_level_write = Instant::now();
             }
             last_led_retry = Instant::now();
-        } else if mode == RingMode::Speech
-            && led_ok
-            && brightness != led_level
-            && (brightness.abs_diff(led_level) >= LED_LEVEL_STEP
-                || last_level_write.elapsed() >= LED_LEVEL_INTERVAL)
-        {
-            match set_led_brightness(&mut i2c, brightness) {
-                Ok(()) => {
-                    led_level = brightness;
-                    last_level_write = Instant::now();
-                }
-                Err(e) => {
-                    warn!("XVF3800 LED brightness failed: {e}");
-                    led_ok = false;
-                    last_led_retry = Instant::now();
-                }
-            }
         }
 
         if !routing_ok && last_routing_retry.elapsed() >= Duration::from_secs(1) {

@@ -9,7 +9,7 @@ mod usb;
 mod vadnet;
 mod xvf3800;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,6 @@ fn main() -> Result<()> {
     let acked = Arc::new(AtomicBool::new(false));
     let restart = Arc::new(AtomicBool::new(false));
     let ring_speech = Arc::new(AtomicBool::new(false));
-    let ring_level = Arc::new(AtomicU8::new(0));
 
     let mut led = PinDriver::output(pins.gpio21)?;
     led.set_high()?;
@@ -74,7 +73,6 @@ fn main() -> Result<()> {
     {
         let recording = recording.clone();
         let ring_speech = ring_speech.clone();
-        let ring_level = ring_level.clone();
         std::thread::Builder::new()
             .name("xvf".into())
             .stack_size(6 * 1024)
@@ -85,7 +83,6 @@ fn main() -> Result<()> {
                     pins.gpio6,
                     recording,
                     ring_speech,
-                    ring_level,
                 ) {
                     error!("XVF3800 task ended: {e}");
                 }
@@ -99,7 +96,6 @@ fn main() -> Result<()> {
         let acked = acked.clone();
         let restart = restart.clone();
         let ring_speech = ring_speech.clone();
-        let ring_level = ring_level.clone();
         std::thread::Builder::new()
             .name("audio".into())
             .stack_size(64 * 1024)
@@ -115,7 +111,6 @@ fn main() -> Result<()> {
                     acked,
                     restart,
                     ring_speech,
-                    ring_level,
                 ) {
                     error!("audio task ended: {e}");
                 }
