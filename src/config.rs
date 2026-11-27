@@ -16,18 +16,6 @@ pub const PRE_ROLL_MS: u32 = 3_000;
 /// Candidate must contain at least this much active audio before it is sent.
 pub const CANDIDATE_MIN_ACTIVE_MS: u32 = 500;
 pub const HOLDBACK_MS: u32 = 1_500;
-/// The software gate rejects VADNet speech below this absolute level.
-pub const SPEECH_GATE_MIN_DBFS: f32 = -34.0;
-/// The gate threshold is also raised this far above the tracked noise floor.
-pub const SPEECH_GATE_MARGIN_DB: f32 = 2.0;
-/// Slow noise-floor tracking, applied only while VADNet reports non-speech.
-pub const SPEECH_GATE_NOISE_ALPHA: f32 = 0.01;
-/// One-pole smoothing for the gate's energy estimate. At 10 ms blocks, 0.05
-/// gives an approximately 200 ms window.
-pub const SPEECH_GATE_SMOOTHING: f32 = 0.05;
-/// Required accumulated gated speech before a block can count as speech.
-/// Short gaps release this counter at twice the block rate.
-pub const SPEECH_GATE_CONFIRM_MS: u32 = 300;
 /// Keep the ring blue this long after the last speech block inside an open
 /// segment, then turn it off.
 pub const RING_SPEECH_HOLD_MS: u32 = 400;

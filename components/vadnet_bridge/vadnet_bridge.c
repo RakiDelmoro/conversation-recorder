@@ -60,7 +60,7 @@ int vadnet_bridge_init(void)
 
     s_fill = 0;
     s_last = 0;
-    s_iface->set_energy_threshold(s_vad, -34.0f);
+    s_iface->set_energy_threshold(s_vad, -45.0f);
     if (!s_iface->set_det_threshold(s_vad, 0.5f)) {
         ESP_LOGW(TAG, "could not set VADNet detection threshold");
     }
