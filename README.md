@@ -1,38 +1,38 @@
-# Conversation Recorder — ESP32-S3 + XVF3800
+# Conversation Recorder Firmware
 
 Firmware for an XIAO ESP32-S3 Plus mounted on a Seeed reSpeaker XVF3800
 four-microphone array. The device performs always-on capture, gates speech with
 ESP-SR VADNet on the ESP32-S3, segments utterances, buffers unacknowledged
-audio in PSRAM, and streams 16 kHz mono PCM over the native USB CDC port to a
-host that owns STT and downstream knowledge-base processing.
+audio in PSRAM, and streams framed 16 kHz mono PCM over the native USB CDC
+port.
 
-There is no Wi-Fi, TCP, or discovery path. The only transport is USB.
+Speech detection, segmentation, and buffering run entirely on the device. The
+only transport is USB; there is no Wi-Fi, TCP, or discovery path.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  X["XVF3800<br/>I2S master"] -->|"48 kHz stereo"| A["audio task"]
+  X["XVF3800<br/>I2S master"] -->|"48 kHz, 32-bit stereo"| A["audio task"]
   A -->|"16 kHz mono"| V["ESP-SR VADNet"]
-  V --> R["recorder"]
+  V -->|"speech / non-speech"| R["recorder"]
   A --> R
   R --> Q["PSRAM queue<br/>4 MB"]
-  Q --> U["USB CDC transport"]
-  U <-->|"START / AUDIO / END / ACK"| H["host ingest server"]
-  R -->|"ring state"| L["XVF3800 LED ring"]
+  Q --> U["USB CDC<br/>CREC records"]
+  R -->|"state"| L["XVF3800 LED ring"]
+  R -->|"state"| S["XIAO status LED"]
 ```
 
 Data path:
 
 1. The XVF3800 provides a 48 kHz, 32-bit stereo I2S stream.
-2. The audio task extracts channel 0, converts to 16-bit mono, and resamples
-   the measured input rate to 16 kHz.
+2. The audio task extracts the ASR-routed channel, converts to 16-bit mono,
+   filters, and resamples the measured input rate to 16 kHz.
 3. ESP-SR VADNet classifies the 16 kHz mono stream.
-4. The recorder applies pre-roll, minimum-speech, holdback, and segment-cap
+4. The recorder applies pre-roll, speech-duration, holdback, and segment-cap
    rules, then queues `START`/`AUDIO`/`END` records.
-5. The USB transport drains the queue over the native USB port and frees slots
-   only after the host ACKs.
-6. The host writes one WAV per segment and performs STT asynchronously.
+5. The USB transport drains the queue over the native USB port. Slots are
+   released only after the USB side acknowledges them.
 
 ## Repository layout
 
@@ -40,28 +40,30 @@ Data path:
 |---|---|
 | `src/main.rs` | Peripheral setup, thread wiring, status loop |
 | `src/audio.rs` | I2S capture, channel extraction, measured-rate resampling to 16 kHz |
-| `src/recorder.rs` | Segmentation state machine and queue producer |
-| `src/queue.rs` | Fixed-slot PSRAM ring with ACK-driven reclamation |
-| `src/usb.rs` | USB CDC transport and ACK/resume logic |
+| `src/recorder.rs` | Segmentation state machine, pre-roll, queue producer |
+| `src/queue.rs` | Fixed-slot PSRAM ring with acknowledgement-driven reclamation |
+| `src/usb.rs` | USB CDC transport, ACK handling, resume |
+| `src/protocol.rs` | Record encoding/decoding and ACK parser |
 | `src/xvf3800.rs` | I2C firmware probe, ASR routing, LED ring |
 | `src/vadnet.rs` | Rust wrapper for the ESP-SR VADNet bridge |
-| `src/protocol.rs` | Wire record encoding/decoding and ACK parser |
 | `src/config.rs` | Build-time configuration |
-| `components/vadnet_bridge/` | ESP-SR VADNet bridge and model partition setup |
-| `audio-receiver/receiver.py` | USB serial receiver, WAV writer, and ACKs |
-| `audio-receiver/test_receiver.py` | USB serial integration tests |
-| `audio-receiver/README.md` | Receiver usage, Windows, and Docker |
+| `components/vadnet_bridge/` | ESP-SR VADNet bridge |
+| `components_esp32s3.lock` | Resolved ESP-IDF component versions |
+| `firmware-assets/` | VADNet model blob and partition table for flashing |
+| `partitions.csv` | Custom partition table |
+| `sdkconfig.defaults` | ESP-IDF defaults |
+| `build.rs` | ESP-IDF build environment integration |
 
 ## Prerequisites
 
 - ESP32-S3 Rust toolchain (`espup`, `esp` toolchain).
 - ESP-IDF v5.4, activated in the environment.
 - `ldproxy` for linking.
-- `espflash` on the host for flashing.
-- Python 3.10+ for the reference receiver.
+- `espflash` for flashing.
+- Python 3.10+ if running ESP-IDF tooling that requires it.
 
-The repository builds only; flashing is performed from the host because the
-development container does not pass through USB.
+The development container builds only; flashing is performed from a machine
+with access to the device's USB port.
 
 ## Build
 
@@ -124,27 +126,28 @@ All build-time settings live in `src/config.rs`.
 | `I2S_CHANNEL` | `0` | Routed ASR lane; use `1` for the default right ASR lane |
 | `MIN_SPEECH_MS` | `600` | Speech required in the rolling 2 s window |
 | `PRE_ROLL_MS` | `3_000` | Audio retained before trigger |
-| `LOG_ONLY` | `false` | Set `true` for log-only simulation; `false` sends audio |
 | `HOLDBACK_MS` | `1_500` | Trailing audio queued after speech |
-| `RING_SPEECH_HOLD_MS` | `400` | Keep the XVF ring blue this long after speech stops, then green |
+| `SPEECH_RESUME_MS` | `300` | Speech required to reset the silence timer |
+| `SILENCE_TIMEOUT_MS` | `60_000` | Segment ends after this much silence |
+| `SEGMENT_MS` | `1_800_000` | Hard cap for continuous speech |
+| `RING_SPEECH_HOLD_MS` | `400` | Keep the ring blue this long after speech stops |
 | `RING_LEVEL_MIN_DBFS` | `-50.0` | Lower end of the speech-level-to-brightness map |
 | `RING_LEVEL_MAX_DBFS` | `-12.0` | Upper end of the speech-level-to-brightness map |
 | `RING_LEVEL_FLOOR` | `40` | Minimum ring brightness while speech is active |
 | `RING_LEVEL_RELEASE` | `0.80` | Per-10 ms brightness decay when the level falls |
 | `RING_HOLD_BRIGHTNESS` | `128` | Green hold-state brightness |
-| `SILENCE_TIMEOUT_MS` | `60_000` | Conversation ends after this much silence |
-| `SEGMENT_MS` | `1_800_000` | Hard cap for continuous speech |
-| `ONE_SHOT` | `false` | One-shot test mode; false uses VAD segmentation |
-| `ONE_SHOT_MS` | `60_000` | One-shot capture duration |
 | `QUEUE_BYTES` | `4 MB` | Unacknowledged audio buffer |
+| `ONE_SHOT` | `false` | One-shot capture mode; disables VAD segmentation |
+| `ONE_SHOT_MS` | `60_000` | One-shot capture duration |
+| `LOG_ONLY` | `false` | Log candidates but do not queue or send audio |
 
 ## Flash
 
-Stop the serial receiver before flashing; it holds the USB tty open.
+Disconnect any serial monitor that holds the USB CDC port.
 
 The VADNet build uses a custom partition table and a model partition.
-`espflash flash` writes its own default partition table at `0x8000`, so
-write the custom table **last**:
+`espflash flash` writes its own default partition table at `0x8000`, so write
+the custom table **last**:
 
 ```sh
 espflash flash --monitor --chip esp32s3 \
@@ -153,8 +156,8 @@ espflash write-bin 0x400000 firmware-assets/srmodels.bin --chip esp32s3
 espflash write-bin 0x8000 firmware-assets/partition-table.bin --chip esp32s3
 ```
 
-The table must define `factory` at `0x10000` (4 MB) and `model` at
-`0x400000` (3 MB). `firmware-assets/` ships the matching `srmodels.bin`
+The table defines `factory` at `0x10000` (4 MB) and `model` at `0x400000`
+(3 MB). `firmware-assets/` ships the matching `srmodels.bin`
 (`CONFIG_SR_VADN_VADNET1_MEDIUM=y`) and partition table.
 
 Expected boot and runtime logs:
@@ -165,14 +168,6 @@ I2S configured 48000 Hz, observed 4799x Hz
 vadnet: VADNet vadnet1_medium ready: chunk=... rate=16000 energy=-40.0 dBFS
 usb: host attached
 ```
-
-Under WSL2, attach the USB device before starting the receiver:
-
-```sh
-usbipd attach --wsl --busid <id>
-```
-
-It then appears as `/dev/ttyACM0` or similar.
 
 ## XVF3800 requirements
 
@@ -209,6 +204,15 @@ XVF3800 I2C address: `0x2C`.
 
 ## Runtime behavior
 
+### Capture
+
+- The XVF3800 supplies 48 kHz, 32-bit stereo I2S as master.
+- The audio task extracts the configured channel, converts to 16-bit mono,
+  applies a sixth-order low-pass at 7.2 kHz, and resamples to 16 kHz.
+- The actual input rate is measured over the first two seconds. A nominal
+  48 kHz stream is still resampled through the same fractional phase
+  accumulator.
+
 ### Speech detection
 
 - ESP-SR VADNet (`vadnet1_medium`) runs on the ESP32-S3 and classifies the
@@ -217,14 +221,14 @@ XVF3800 I2C address: `0x2C`.
   exits with an error instead of falling back to XVF or energy heuristics.
 - A segment is committed after 600 ms of speech in a rolling 2 s window. Short
   gaps do not reset the window, so normal speech with plosives and pauses still
-  triggers while a clap does not. The 3 s pre-roll is the candidate buffer: it
-  captures audio before the commit point, so the first word is not lost.
-- Before sending, the candidate pre-roll is checked for active duration and
-  envelope peaks. A clap/short transient is rejected on-device and never
-  queued; the LED stays in its idle pattern.
-- The task measures the actual I2S rate over the first two seconds and
-  resamples that rate to 16 kHz. A nominal 48 kHz stream is still resampled
-  with the same fractional phase accumulator.
+  triggers.
+- The 3 s pre-roll is the candidate buffer: it captures audio before the
+  commit point, so the first word is not lost.
+- Before queuing, the candidate is checked for active duration and envelope
+  peaks. A clap or short transient is rejected on-device and never sent.
+- VADNet distinguishes speech from noise. It does not identify speakers and
+  does not reject music, TV, or other non-target voices that it classifies as
+  speech.
 
 ### Segmentation
 
@@ -247,27 +251,28 @@ boundary. The first segment's cap includes the pre-roll window.
 - 4 MB PSRAM ring of fixed slots: `START`, `AUDIO` (≤1600 samples / 100 ms),
   and `END`.
 - Audio is produced at 32 KB/s (16 kHz × 2 bytes).
-- The USB transport sends continuously; slots are freed only after ACK.
-- A missing host accumulates approximately 128 s of audio. At full capacity
-  the current segment ends with `reason 1`; new segments cannot start until
-  ACKs free space.
+- The USB transport sends continuously; slots are freed only after an ACK.
+- An unresponsive USB reader accumulates approximately 128 s of audio. At full
+  capacity the current segment ends with `reason 1`; new segments cannot start
+  until ACKs free space.
 - The queue is volatile. Power loss discards unacknowledged audio. There is no
   SD card or flash spool.
 
 ### LED
 
+The XIAO status LED uses GPIO21, active low.
+
 | Condition | Pattern |
 |---|---|
-| Audio not ready or USB host detached | 100 ms on / 200 ms period |
+| Audio not ready or USB detached | 100 ms on / 200 ms period |
 | Backlog > 256 KB | 500 ms on / 1000 ms period |
 | Recording | Solid on |
 | Idle | 20 ms on / 2000 ms period |
 
-The XIAO status LED follows the open/closed segment, not instantaneous speech. It
+The XIAO LED follows the open/closed segment, not instantaneous speech. It
 stays solid through the 60 s silence wait and turns off when `END` is queued.
 
-The XVF3800 LED ring reflects the recorder's session state, not per-block
-VADNet output:
+The XVF3800 LED ring reflects the recorder's session state:
 
 | Ring | Meaning |
 |---|---|
@@ -275,53 +280,33 @@ VADNet output:
 | Pulsing blue (VU) | Session committed; speech is being recorded |
 | Solid green | Session still open, waiting for more speech (up to 60 s) |
 
-While VADNet reports speech, the blue brightness tracks the microphone RMS
-level with a fast attack and `RING_LEVEL_RELEASE` decay, so the ring visibly
-breathes/pulses with the voice. This is amplitude, not VADNet confidence: the
-model only returns speech/non-speech. The XVF task polls every 50 ms and writes
-brightness only when it changes, so the I2C bus is idle between updates. After
+While VADNet reports speech, blue brightness tracks the microphone RMS level
+with a fast attack and `RING_LEVEL_RELEASE` decay. This is amplitude, not
+VADNet confidence: the model returns only speech/non-speech. The XVF task polls
+every 50 ms and writes brightness only when it changes. After
 `RING_SPEECH_HOLD_MS` (400 ms) without speech, the ring switches to solid green
-and stays green through the 60 s silence timeout until `END`. Because the ring
-follows the recorder, claps/noise rejected by the candidate check do not light
-it. Expect ~0.6-0.7 s from speech onset to blue: the commit needs
-`MIN_SPEECH_MS` (600 ms), plus a 10 ms block and the XVF task's 50 ms poll.
-Utterances shorter than that window never open a segment, so they never light
-the ring.
+and stays green through the 60 s silence timeout until `END`. Rejected
+candidates do not light the ring.
 
-The XIAO LED turns on only after the recorder has confirmed a segment start, i.e.
-after `MIN_SPEECH_MS` of speech that passed the start gate. A short clap or
-noise burst does not light it.
+The ring reaches blue about 0.6–0.7 s after speech onset: the commit needs
+`MIN_SPEECH_MS` (600 ms), plus an audio block and the XVF task's 50 ms poll.
+Utterances shorter than that window never open a segment.
 
-## USB transport
+## USB output
 
-The device enumerates as a USB CDC serial device and streams the same records
-used by the previous TCP path. On the host:
+The device enumerates as a USB CDC serial device. The ESP-IDF console shares
+the port, so records are framed with a magic value and a reader must resync
+past log text.
 
-```sh
-python3 audio-receiver/receiver.py --serial /dev/ttyACM0
-```
-
-On Windows, install pyserial and use the COM port:
-
-```powershell
-python -m pip install -r audio-receiver\requirements.txt
-python audio-receiver\receiver.py --serial COM3
-```
-
-Behavior:
-
-- Opens the port raw on POSIX or via pyserial on Windows; no echo or flow
-  control.
-- Writes one 16 kHz mono s16le WAV per segment.
-- Sends ACKs back over the same tty after each `AUDIO` record and after `END`.
-- The ESP-IDF console shares the port. The receiver resyncs past log text by
-  scanning for the record magic.
+- `START` carries session identity, sample format, and starting offset.
+- `AUDIO` carries raw s16le PCM.
+- `END` closes the segment with a reason code.
+- The reader ACKs received sample counts; the device frees queued slots only
+  after the ACK.
 - Each record is written in one short write into an 8 KB TX ring, so a console
   line cannot split an audio record.
-- If the cable drops, the device rewinds to the last ACK. The receiver reopens
-  the tty and the device resends `START` with that offset; the partial WAV is
-  truncated and continued.
-- Stop the receiver before `espflash flash`.
+- If the link drops, the device rewinds to the last ACK. On reconnect it resends
+  `START` with that sample offset and continues from there.
 
 ## Wire protocol
 
@@ -343,65 +328,45 @@ u32 payload length
 | `ACK` | `0x81` | `u32 session_id`, `u32 acked_samples` |
 
 `END.reason`: `0` silence timeout, `1` queue overflow, `2` segment cap.
-`END.crc32` is currently `0` (not provided).
-ACK header flag bit 0 marks the final ACK sent after `END`.
+`END.crc32` is currently `0` (not provided). ACK header flag bit 0 marks the
+final ACK sent after `END`.
 
-## Reliability and failure modes
+## Failure modes
 
 | Failure | Behavior |
 |---|---|
-| USB host absent | No records leave the device; PSRAM fills; LED slow-blinks |
-| USB cable drop | Device rewinds to last ACK; receiver reopens the tty and resumes |
+| USB detached | No records leave the device; PSRAM fills; LED slow-blinks |
+| USB link drop | Device rewinds to the last ACK and resumes from that offset |
 | Device power loss | Unacknowledged PSRAM audio is lost |
-| Receiver stops | Device keeps queueing; reconnect resumes from last ACK |
+| USB reader stalls | Device keeps queueing; reconnect resumes from the last ACK |
 | Queue overflow | Current segment ends with `reason 1` |
 | XVF I2S firmware absent | No usable I2S clock/data; rate check logs failure |
 | VADNet model missing | VADNet init fails; audio task exits with an error |
+| XVF I2C unreachable | ASR routing and LED ring retry; capture continues if I2S is up |
 
-## Security
+## Transport security
 
-- The transport is physical USB. Access to the host or cable grants access to
-  the microphone stream.
-- WAV files on the host are plaintext; apply host disk encryption and access
-  controls as required.
-- There is no network authentication or encryption layer because there is no
-  network transport.
-
-## Testing
-
-Build:
-
-```sh
-cargo build --release
-```
-
-USB ingest tests:
-
-```sh
-python3 audio-receiver/test_receiver.py -v
-```
-
-The tests use a PTY to cover START/AUDIO/END ingestion, WAV correctness,
-console-text resync, and resume after a link drop.
+USB is the only transport; there is no network stack, authentication, or
+encryption layer. Physical access to the USB port grants access to the
+microphone stream.
 
 ## On-device VAD
 
 VADNet comes from Espressif's ESP-SR component (`espressif/esp-sr` 2.6.2,
-`CONFIG_SR_VADN_VADNET1_MEDIUM`). `components/vadnet_bridge/` wraps the
-ESP-SR VAD interface, buffers 16 kHz mono audio into the model's expected chunk
-size, and returns a speech/non-speech verdict per chunk.
+`CONFIG_SR_VADN_VADNET1_MEDIUM`). `components/vadnet_bridge/` wraps the ESP-SR
+VAD interface, buffers 16 kHz mono audio into the model's expected chunk size,
+and returns a speech/non-speech verdict per chunk.
 
 VADNet is a speech/non-speech classifier. It rejects most steady noise, cat/dog
 sounds, and instrumental music, but it is not a human-voice or source
-classifier. TV, podcasts, other people, and songs with vocals are human speech
-and will pass. This is intentional for this recorder.
+classifier. TV, podcasts, other people, and songs with vocals pass as speech.
 
 ## Known limitations
 
 - No persistent local storage; unacknowledged audio lives only in PSRAM.
 - USB only; no Wi-Fi, TCP, or discovery.
-- WAV files on the host are plaintext.
 - The `model` partition and `srmodels.bin` must match the firmware; a missing
   model stops the audio task at boot.
 - The XVF3800 must run a matching I2S firmware image.
-- The receiver holds the tty open; stop it before flashing.
+- A serial monitor or other process holding the USB CDC port must be closed
+  before flashing.
