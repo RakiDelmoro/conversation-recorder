@@ -128,6 +128,8 @@ All build-time settings live in `src/config.rs`.
 | `PRE_ROLL_MS` | `3_000` | Audio retained before trigger |
 | `HOLDBACK_MS` | `1_500` | Trailing audio queued after speech |
 | `SPEECH_RESUME_MS` | `300` | Speech required to reset the silence timer |
+| `SPEECH_ZCR_MIN` | `0.05` | Minimum smoothed ZCR for VADNet speech |
+| `SPEECH_ZCR_WINDOW_MS` | `200` | ZCR smoothing window |
 | `SILENCE_TIMEOUT_MS` | `60_000` | Segment ends after this much silence |
 | `SEGMENT_MS` | `1_800_000` | Hard cap for continuous speech |
 | `RING_SPEECH_HOLD_MS` | `400` | Keep the blue DoA ring this long after speech stops |
@@ -216,6 +218,10 @@ XVF3800 I2C address: `0x2C`.
   exits with an error instead of falling back to XVF or energy heuristics.
 - VADNet runs in mode 2 with a 250 ms minimum speech duration, a 0.5 detection
   threshold, and a -45 dBFS energy threshold.
+- A low-frequency guard follows VADNet. It computes a 200 ms smoothed
+  zero-crossing rate and rejects VADNet speech below `0.05`. This drops
+  low-frequency rumble without imposing an amplitude floor, so quiet speech
+  with normal speech ZCR still passes.
 - A segment is committed after 600 ms of VADNet speech in a rolling 2 s window.
   Short gaps do not reset the window, so normal speech with plosives and pauses
   still triggers.
@@ -355,8 +361,9 @@ and returns a speech/non-speech verdict per chunk.
 VADNet is a speech/non-speech classifier. It rejects most steady noise, cat/dog
 sounds, and instrumental music, but it is not a human-voice or source
 classifier. TV, podcasts, other people, and songs with vocals pass as speech.
-The bridge logs every `VAD speech` / `VAD silence` transition so model triggers
-can be checked directly against the recording.
+The bridge logs every `VAD speech` / `VAD silence` transition, and the recorder
+logs when the ZCR guard rejects an otherwise speech-labelled low-frequency
+event.
 
 ## Known limitations
 

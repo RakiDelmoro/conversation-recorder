@@ -16,6 +16,11 @@ pub const PRE_ROLL_MS: u32 = 3_000;
 /// Candidate must contain at least this much active audio before it is sent.
 pub const CANDIDATE_MIN_ACTIVE_MS: u32 = 500;
 pub const HOLDBACK_MS: u32 = 1_500;
+/// Minimum smoothed zero-crossing rate for VADNet speech. Low-frequency
+/// rumble has a much lower ZCR than speech.
+pub const SPEECH_ZCR_MIN: f32 = 0.05;
+/// Smoothing window for the ZCR check.
+pub const SPEECH_ZCR_WINDOW_MS: f32 = 200.0;
 /// Keep the ring blue this long after the last speech block inside an open
 /// segment, then turn it off.
 pub const RING_SPEECH_HOLD_MS: u32 = 400;

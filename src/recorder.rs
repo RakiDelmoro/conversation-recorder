@@ -24,6 +24,54 @@ struct CandidateStats {
     peaks: usize,
 }
 
+/// Rejects VADNet speech with a low zero-crossing rate. Low-frequency rumble
+/// can be loud enough to pass the model's energy threshold, but it has far
+/// fewer sign changes than speech. This does not gate on level.
+struct ZcrGate {
+    average: f32,
+    rejected: bool,
+}
+
+impl ZcrGate {
+    fn new() -> Self {
+        Self {
+            average: 1.0,
+            rejected: false,
+        }
+    }
+
+    fn update(&mut self, pcm: &[i16], vad_speech: bool) -> bool {
+        if pcm.len() < 2 {
+            self.average = 1.0;
+            self.rejected = false;
+            return vad_speech;
+        }
+        let crossings = pcm
+            .windows(2)
+            .filter(|w| (w[0] < 0) != (w[1] < 0))
+            .count();
+        let zcr = crossings as f32 / (pcm.len() - 1) as f32;
+        let block_ms = (pcm.len() as f32 * 1000.0 / SAMPLE_RATE as f32).max(1.0);
+        let alpha = (block_ms / config::SPEECH_ZCR_WINDOW_MS).clamp(0.0, 1.0);
+        self.average += alpha * (zcr - self.average);
+
+        let accepted = vad_speech && self.average >= config::SPEECH_ZCR_MIN;
+        if accepted {
+            self.rejected = false;
+        } else if vad_speech && !self.rejected {
+            info!(
+                "recorder: rejected low-frequency VAD speech (zcr={:.3})",
+                self.average
+            );
+            self.rejected = true;
+        }
+        if !vad_speech {
+            self.rejected = false;
+        }
+        accepted
+    }
+}
+
 enum State {
     Idle,
     Active,
@@ -59,6 +107,7 @@ pub struct Recorder {
     restart: Arc<AtomicBool>,
     recording: Arc<AtomicBool>,
     ring_speech: Arc<AtomicBool>,
+    zcr_gate: ZcrGate,
 }
 
 impl Recorder {
@@ -112,6 +161,7 @@ impl Recorder {
             restart,
             recording,
             ring_speech,
+            zcr_gate: ZcrGate::new(),
         }))
     }
 
@@ -131,6 +181,7 @@ impl Recorder {
         }
 
         self.push_pre_roll(pcm);
+        let speech = self.zcr_gate.update(pcm, speech);
 
         let block_ms = (pcm.len() as u32 * 1000 / SAMPLE_RATE as u32).max(1);
         let now_ms = (self.input_samples as u64 + pcm.len() as u64) * 1000 / SAMPLE_RATE;
