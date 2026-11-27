@@ -5,7 +5,7 @@ pub const I2S_SLAVE: bool = true; // XVF3800 drives BCLK/WS
 pub const I2S_BITS: u32 = 32; // v1.0.9 I2S image uses 32-bit slots
 pub const I2S_CHANNEL: usize = 0; // 0 = ASR lane routed at boot, 1 = default R ASR lane
 
-pub const SILENCE_TIMEOUT_MS: u64 = 60_000;
+pub const SILENCE_TIMEOUT_MS: u64 = 2_000;
 /// Speech required inside the rolling window before a segment starts.
 /// Pre-roll keeps the audio before the trigger point.
 pub const MIN_SPEECH_MS: u32 = 600;

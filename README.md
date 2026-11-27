@@ -130,7 +130,7 @@ All build-time settings live in `src/config.rs`.
 | `SPEECH_RESUME_MS` | `300` | Speech required to reset the silence timer |
 | `SPEECH_ZCR_MIN` | `0.05` | Minimum smoothed ZCR for VADNet speech |
 | `SPEECH_ZCR_WINDOW_MS` | `200` | ZCR smoothing window |
-| `SILENCE_TIMEOUT_MS` | `60_000` | Segment ends after this much silence |
+| `SILENCE_TIMEOUT_MS` | `2_000` | Segment ends after this much silence |
 | `SEGMENT_MS` | `1_800_000` | Hard cap for continuous speech |
 | `RING_SPEECH_HOLD_MS` | `400` | Keep the blue DoA ring this long after speech stops |
 | `QUEUE_BYTES` | `4 MB` | Unacknowledged audio buffer |
@@ -239,9 +239,9 @@ XVF3800 I2C address: `0x2C`.
 |---|---|
 | 600 ms speech in a 2 s window | Commit segment; flush 3 s pre-roll |
 | Speech stops | Queue 1.5 s holdback |
-| 60 s of silence | End segment (`reason 0`) |
-| Pause < 60 s | Same segment |
-| Pause > 60 s | Next speech starts a new segment |
+| 2 s of silence | End segment (`reason 0`) |
+| Pause < 2 s | Same segment |
+| Pause > 2 s | Next speech starts a new segment |
 | 30 min cap | Rotate to a new segment without stopping capture (`reason 2`) |
 | Queue overflow | End segment (`reason 1`) |
 
@@ -273,7 +273,7 @@ The XIAO status LED uses GPIO21, active low.
 | Idle | 20 ms on / 2000 ms period |
 
 The XIAO LED follows the open/closed segment, not instantaneous speech. It
-stays solid through the 60 s silence wait and turns off when `END` is queued.
+stays solid through the 2 s silence wait and turns off when `END` is queued.
 
 The XVF3800 LED ring reflects the recorder's session state:
 
@@ -286,7 +286,7 @@ While VADNet reports speech, the ring runs the XVF DoA effect with a black base
 color and a blue direction color. Only the LEDs for the current sound direction
 light. This is the XVF's internal DoA rendering; the ESP32 does not read the
 angle. After `RING_SPEECH_HOLD_MS` (400 ms) without speech, the ring turns off
-and stays off through the 60 s silence timeout until `END`. The XIAO LED remains
+and stays off through the 2 s silence timeout until `END`. The XIAO LED remains
 on during that hold. Rejected candidates do not light the ring.
 
 The ring reaches blue about 0.6–0.7 s after speech onset: the commit needs
