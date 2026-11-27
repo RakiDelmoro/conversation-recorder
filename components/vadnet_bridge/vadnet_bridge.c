@@ -13,7 +13,7 @@ static const esp_vadn_iface_t *s_iface;
 static model_iface_data_t *s_vad;
 static int s_chunk;
 static int s_fill;
-static int s_last = 1;
+static int s_last;
 static int16_t s_buf[2048];
 
 int vadnet_bridge_init(void)
@@ -40,7 +40,7 @@ int vadnet_bridge_init(void)
         return -3;
     }
 
-    s_vad = s_iface->create(name, VAD_MODE_2, 1, 128, 1000);
+    s_vad = s_iface->create(name, VAD_MODE_2, 1, 250, 1000);
     if (s_vad == NULL) {
         ESP_LOGE(TAG, "VADNet create failed for %s", name);
         esp_srmodel_deinit(s_models);
@@ -58,9 +58,15 @@ int vadnet_bridge_init(void)
         return -5;
     }
 
-    s_iface->set_energy_threshold(s_vad, -40.0f);
-    ESP_LOGI(TAG, "VADNet %s ready: chunk=%d rate=%d energy=%.1f dBFS", name,
-             s_chunk, s_iface->get_samp_rate(s_vad),
+    s_fill = 0;
+    s_last = 0;
+    s_iface->set_energy_threshold(s_vad, -34.0f);
+    if (!s_iface->set_det_threshold(s_vad, 0.5f)) {
+        ESP_LOGW(TAG, "could not set VADNet detection threshold");
+    }
+    ESP_LOGI(TAG, "VADNet %s ready: chunk=%d rate=%d threshold=%.3f energy=%.1f dBFS",
+             name, s_chunk, s_iface->get_samp_rate(s_vad),
+             s_iface->get_det_threshold(s_vad),
              s_iface->get_energy_threshold(s_vad));
     return 0;
 }
@@ -83,7 +89,11 @@ int vadnet_bridge_push(const int16_t *samples, int count)
         offset += take;
 
         if (s_fill == s_chunk) {
-            s_last = s_iface->detect(s_vad, s_buf) == VAD_SPEECH;
+            int speech = s_iface->detect(s_vad, s_buf) == VAD_SPEECH;
+            if (speech != s_last) {
+                ESP_LOGI(TAG, "VAD %s", speech ? "speech" : "silence");
+            }
+            s_last = speech;
             s_fill = 0;
         }
     }

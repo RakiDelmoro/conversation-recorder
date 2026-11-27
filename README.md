@@ -128,6 +128,10 @@ All build-time settings live in `src/config.rs`.
 | `PRE_ROLL_MS` | `3_000` | Audio retained before trigger |
 | `HOLDBACK_MS` | `1_500` | Trailing audio queued after speech |
 | `SPEECH_RESUME_MS` | `300` | Speech required to reset the silence timer |
+| `SPEECH_GATE_MIN_DBFS` | `-34.0` | Absolute gate floor |
+| `SPEECH_GATE_MARGIN_DB` | `2.0` | Gate margin above the tracked noise floor |
+| `SPEECH_GATE_SMOOTHING` | `0.05` | Gate energy smoothing per 10 ms block |
+| `SPEECH_GATE_CONFIRM_MS` | `300` | Continuous gated speech required |
 | `SILENCE_TIMEOUT_MS` | `60_000` | Segment ends after this much silence |
 | `SEGMENT_MS` | `1_800_000` | Hard cap for continuous speech |
 | `RING_SPEECH_HOLD_MS` | `400` | Keep the blue DoA ring this long after speech stops |
@@ -160,7 +164,7 @@ Expected boot and runtime logs:
 ```text
 XVF3800 firmware v1.0.9
 I2S configured 48000 Hz, observed 4799x Hz
-vadnet: VADNet vadnet1_medium ready: chunk=... rate=16000 energy=-40.0 dBFS
+vadnet: VADNet vadnet1_medium ready: chunk=... rate=16000 threshold=0.500 energy=-34.0 dBFS
 usb: host attached
 ```
 
@@ -212,11 +216,18 @@ XVF3800 I2C address: `0x2C`.
 
 - ESP-SR VADNet (`vadnet1_medium`) runs on the ESP32-S3 and classifies the
   16 kHz mono stream. Its model is loaded from the `model` flash partition.
-- VADNet is the only speech gate. If it fails to initialize, the audio task
+- VADNet is the only speech model. If it fails to initialize, the audio task
   exits with an error instead of falling back to XVF or energy heuristics.
-- A segment is committed after 600 ms of speech in a rolling 2 s window. Short
-  gaps do not reset the window, so normal speech with plosives and pauses still
-  triggers.
+- VADNet runs in mode 2 with a 250 ms minimum speech duration, a 0.5 detection
+  threshold, and a -34 dBFS energy threshold.
+- A software gate follows VADNet. It tracks the room noise floor and requires
+  300 ms of accumulated VADNet speech above
+  `max(-34 dBFS, noise floor + 2 dB)`. Short gaps release the counter at twice
+  the block rate. This rejects steady noise and isolated clicks that the model
+  can mistake for speech.
+- A segment is committed after 600 ms of gated speech in a rolling 2 s window.
+  Short gaps do not reset the window, so normal speech with plosives and pauses
+  still triggers.
 - The 3 s pre-roll is the candidate buffer: it captures audio before the
   commit point, so the first word is not lost.
 - Before queuing, the candidate is checked for active duration and envelope
@@ -353,6 +364,8 @@ and returns a speech/non-speech verdict per chunk.
 VADNet is a speech/non-speech classifier. It rejects most steady noise, cat/dog
 sounds, and instrumental music, but it is not a human-voice or source
 classifier. TV, podcasts, other people, and songs with vocals pass as speech.
+The bridge logs every `VAD speech` / `VAD silence` transition so false model
+triggers can be distinguished from the downstream energy gate.
 
 ## Known limitations
 

@@ -24,6 +24,66 @@ struct CandidateStats {
     peaks: usize,
 }
 
+/// Rejects VADNet positives that are too quiet for the tracked room noise or
+/// too short to be speech. This is the second stage after the model: VADNet
+/// supplies the speech/non-speech decision, while this gate removes steady
+/// noise and isolated clicks that the model can mistake for speech.
+struct SpeechGate {
+    noise_db: f32,
+    power: f32,
+    speech_ms: u32,
+}
+
+impl SpeechGate {
+    fn new() -> Self {
+        Self {
+            noise_db: -60.0,
+            power: 1.0e-6, // -60 dBFS in normalized mean-square power
+            speech_ms: 0,
+        }
+    }
+
+    fn update(&mut self, pcm: &[i16], vad_speech: bool) -> bool {
+        if pcm.is_empty() {
+            self.speech_ms = 0;
+            return false;
+        }
+
+        let mut sum = 0.0f32;
+        for &sample in pcm {
+            let value = sample as f32 / 32768.0;
+            sum += value * value;
+        }
+        let power = sum / pcm.len() as f32;
+        self.power += (power - self.power) * config::SPEECH_GATE_SMOOTHING;
+        let db = 10.0 * self.power.max(1.0e-18).log10();
+        let threshold =
+            (self.noise_db + config::SPEECH_GATE_MARGIN_DB).max(config::SPEECH_GATE_MIN_DBFS);
+
+        // Only non-speech, sub-threshold audio feeds the noise estimate. A
+        // click above the threshold must not drag the floor upward.
+        if !vad_speech && db < threshold {
+            self.noise_db +=
+                (db - self.noise_db) * config::SPEECH_GATE_NOISE_ALPHA;
+            self.noise_db = self.noise_db.clamp(-80.0, -20.0);
+        }
+
+        let block_ms = (pcm.len() as u32 * 1000 / SAMPLE_RATE as u32).max(1);
+        if vad_speech && db >= threshold {
+            self.speech_ms = self
+                .speech_ms
+                .saturating_add(block_ms)
+                .min(1_000);
+        } else {
+            // Leaky release: a short gap does not immediately drop a confirmed
+            // speech run, but isolated clicks never accumulate enough.
+            self.speech_ms = self.speech_ms.saturating_sub(block_ms * 2);
+        }
+
+        vad_speech && self.speech_ms >= config::SPEECH_GATE_CONFIRM_MS
+    }
+}
+
 enum State {
     Idle,
     Active,
@@ -59,6 +119,7 @@ pub struct Recorder {
     restart: Arc<AtomicBool>,
     recording: Arc<AtomicBool>,
     ring_speech: Arc<AtomicBool>,
+    speech_gate: SpeechGate,
 }
 
 impl Recorder {
@@ -112,6 +173,7 @@ impl Recorder {
             restart,
             recording,
             ring_speech,
+            speech_gate: SpeechGate::new(),
         }))
     }
 
@@ -131,6 +193,7 @@ impl Recorder {
         }
 
         self.push_pre_roll(pcm);
+        let speech = self.speech_gate.update(pcm, speech);
 
         let block_ms = (pcm.len() as u32 * 1000 / SAMPLE_RATE as u32).max(1);
         let now_ms = (self.input_samples as u64 + pcm.len() as u64) * 1000 / SAMPLE_RATE;
