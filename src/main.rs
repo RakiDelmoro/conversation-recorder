@@ -5,13 +5,11 @@ mod config;
 mod protocol;
 mod queue;
 mod recorder;
-mod ten_vad_model;
 mod usb;
-mod vad;
 mod vadnet;
 mod xvf3800;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +21,6 @@ use esp_idf_svc::log::EspLogger;
 use log::{error, info};
 
 use crate::queue::SharedQueue;
-use crate::xvf3800::VadState;
 
 const LED_BACKLOG_BYTES: usize = 262_144;
 
@@ -39,14 +36,14 @@ fn main() -> Result<()> {
         ..
     } = Peripherals::take()?;
 
-    let vad = Arc::new(VadState::new());
     let shared = Arc::new(SharedQueue::new(config::QUEUE_BYTES)?);
     let recording = Arc::new(AtomicBool::new(false));
     let audio_ok = Arc::new(AtomicBool::new(false));
     let usb_link = Arc::new(AtomicBool::new(false));
     let acked = Arc::new(AtomicBool::new(false));
     let restart = Arc::new(AtomicBool::new(false));
-    let speech_active = Arc::new(AtomicBool::new(false));
+    let ring_speech = Arc::new(AtomicBool::new(false));
+    let ring_level = Arc::new(AtomicU8::new(0));
 
     let mut led = PinDriver::output(pins.gpio21)?;
     led.set_high()?;
@@ -75,28 +72,34 @@ fn main() -> Result<()> {
     }
 
     {
-        let vad = vad.clone();
-        let speech_active = speech_active.clone();
+        let recording = recording.clone();
+        let ring_speech = ring_speech.clone();
+        let ring_level = ring_level.clone();
         std::thread::Builder::new()
             .name("xvf".into())
             .stack_size(6 * 1024)
             .spawn(move || {
-                if let Err(e) =
-                    xvf3800::task(i2c0, pins.gpio5, pins.gpio6, vad, speech_active)
-                {
+                if let Err(e) = xvf3800::task(
+                    i2c0,
+                    pins.gpio5,
+                    pins.gpio6,
+                    recording,
+                    ring_speech,
+                    ring_level,
+                ) {
                     error!("XVF3800 task ended: {e}");
                 }
             })?;
     }
 
     {
-        let vad = vad.clone();
         let shared = shared.clone();
         let recording = recording.clone();
         let audio_ok = audio_ok.clone();
         let acked = acked.clone();
         let restart = restart.clone();
-        let speech_active = speech_active.clone();
+        let ring_speech = ring_speech.clone();
+        let ring_level = ring_level.clone();
         std::thread::Builder::new()
             .name("audio".into())
             .stack_size(64 * 1024)
@@ -106,13 +109,13 @@ fn main() -> Result<()> {
                     pins.gpio8,
                     pins.gpio7,
                     pins.gpio43,
-                    vad,
                     shared,
                     recording,
                     audio_ok,
                     acked,
                     restart,
-                    speech_active,
+                    ring_speech,
+                    ring_level,
                 ) {
                     error!("audio task ended: {e}");
                 }
@@ -145,10 +148,9 @@ fn main() -> Result<()> {
             let psram_free = unsafe {
                 esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_SPIRAM)
             };
-            let vad_stats = vad.snapshot();
             info!(
-                "app: queue={} B, psram_free={} B, recording={}, vad_polls={}, vad_errors={}",
-                backlog, psram_free, is_recording, vad_stats.polls, vad_stats.errors
+                "app: queue={} B, psram_free={} B, recording={}",
+                backlog, psram_free, is_recording
             );
             last_stats = Instant::now();
         }

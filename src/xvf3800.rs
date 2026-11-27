@@ -1,6 +1,6 @@
-//! XVF3800 control over I2C: VAD flag, direction of arrival, boot routing.
+//! XVF3800 control over I2C: boot routing and LED ring.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,54 +12,6 @@ use esp_idf_hal::units::Hertz;
 use log::{info, warn};
 
 use crate::config;
-
-pub struct VadState {
-    speech: AtomicBool,
-    doa: AtomicU32,
-    polls: AtomicU32,
-    errors: AtomicU32,
-    ever_ok: AtomicBool,
-    last_ok_ms: AtomicU32,
-}
-
-pub struct VadSnapshot {
-    pub healthy: bool,
-    pub speech: bool,
-    pub doa: u16,
-    pub polls: u32,
-    pub errors: u32,
-}
-
-impl VadState {
-    pub fn new() -> Self {
-        Self {
-            speech: AtomicBool::new(false),
-            doa: AtomicU32::new(u16::MAX as u32),
-            polls: AtomicU32::new(0),
-            errors: AtomicU32::new(0),
-            ever_ok: AtomicBool::new(false),
-            last_ok_ms: AtomicU32::new(0),
-        }
-    }
-
-    pub fn snapshot(&self) -> VadSnapshot {
-        let ever_ok = self.ever_ok.load(Ordering::Relaxed);
-        let now_ms = now_ms();
-        let last = self.last_ok_ms.load(Ordering::Relaxed);
-        let healthy = ever_ok && now_ms.wrapping_sub(last) < 2_000;
-        VadSnapshot {
-            healthy,
-            speech: self.speech.load(Ordering::Relaxed),
-            doa: self.doa.load(Ordering::Relaxed) as u16,
-            polls: self.polls.load(Ordering::Relaxed),
-            errors: self.errors.load(Ordering::Relaxed),
-        }
-    }
-}
-
-fn now_ms() -> u32 {
-    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1000) as u32
-}
 
 fn xvf_read(i2c: &mut I2cDriver, resid: u8, cmd: u8, out: &mut [u8]) -> Result<()> {
     assert!(out.len() + 1 <= 64);
@@ -107,11 +59,6 @@ fn xvf_write(i2c: &mut I2cDriver, resid: u8, cmd: u8, data: &[u8]) -> Result<()>
     Ok(())
 }
 
-const DOA_RESID: u8 = 20;
-/// I2S firmware v1.0.8 moved DOA_VALUE from command 19 to 18.
-const DOA_CMD: u8 = 18;
-const DOA_CMD_LEGACY: u8 = 19;
-
 fn read_version(i2c: &mut I2cDriver) -> Result<[u8; 3]> {
     // The XVF3800 may still be booting when the firmware reaches this code.
     let mut last_error = None;
@@ -130,39 +77,51 @@ fn read_version(i2c: &mut I2cDriver) -> Result<[u8; 3]> {
 
 const LED_RESID: u8 = 20;
 const LED_EFFECT_CMD: u8 = 12;
+const LED_BRIGHTNESS_CMD: u8 = 13;
 const LED_COLOR_CMD: u8 = 16;
 const LED_EFFECT_OFF: u8 = 0;
-const LED_EFFECT_SINGLE: u8 = 3;
-const LED_ON_COLOR: u32 = 0x00FF00;
+const LED_EFFECT_SOLID: u8 = 3;
+const LED_SPEECH_COLOR: u32 = 0x0000FF;
+const LED_HOLD_COLOR: u32 = 0x00FF00;
+/// Minimum brightness change before another I2C write while speech is active.
+const LED_LEVEL_STEP: u8 = 4;
+const LED_LEVEL_INTERVAL: Duration = Duration::from_millis(100);
 
-fn set_led_ring(i2c: &mut I2cDriver, active: bool) -> Result<()> {
-    let effect = if active {
-        LED_EFFECT_SINGLE
-    } else {
-        LED_EFFECT_OFF
-    };
-    xvf_write(i2c, LED_RESID, LED_EFFECT_CMD, &[effect])?;
-    if active {
-        xvf_write(
-            i2c,
-            LED_RESID,
-            LED_COLOR_CMD,
-            &LED_ON_COLOR.to_le_bytes(),
-        )?;
-    }
-    Ok(())
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RingMode {
+    Off,
+    Speech,
+    Hold,
 }
 
-const AEC_RESID: u8 = 33;
-const AEC_SPENERGY_CMD: u8 = 80;
-
-fn read_speech_energy(i2c: &mut I2cDriver, out: &mut [f32; 4]) -> Result<()> {
-    let mut buf = [0u8; 16];
-    xvf_read(i2c, AEC_RESID, AEC_SPENERGY_CMD, &mut buf)?;
-    for (i, value) in out.iter_mut().enumerate() {
-        let o = i * 4;
-        *value = f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+impl RingMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Speech => "pulsing blue (speech)",
+            Self::Hold => "solid green (hold)",
+        }
     }
+}
+
+fn set_led_brightness(i2c: &mut I2cDriver, brightness: u8) -> Result<()> {
+    xvf_write(i2c, LED_RESID, LED_BRIGHTNESS_CMD, &[brightness])
+}
+
+fn set_led_ring(i2c: &mut I2cDriver, mode: RingMode, brightness: u8) -> Result<()> {
+    if mode == RingMode::Off {
+        xvf_write(i2c, LED_RESID, LED_EFFECT_CMD, &[LED_EFFECT_OFF])?;
+        return Ok(());
+    }
+    let color = match mode {
+        RingMode::Speech => LED_SPEECH_COLOR,
+        _ => LED_HOLD_COLOR,
+    };
+    // Set colour and brightness before starting the effect so the old look is
+    // never visible under the new state.
+    xvf_write(i2c, LED_RESID, LED_COLOR_CMD, &color.to_le_bytes())?;
+    set_led_brightness(i2c, brightness)?;
+    xvf_write(i2c, LED_RESID, LED_EFFECT_CMD, &[LED_EFFECT_SOLID])?;
     Ok(())
 }
 
@@ -181,15 +140,16 @@ pub fn task(
     i2c0: I2C0,
     sda: Gpio5,
     scl: Gpio6,
-    state: Arc<VadState>,
-    speech_active: Arc<AtomicBool>,
+    recording: Arc<AtomicBool>,
+    ring_speech: Arc<AtomicBool>,
+    ring_level: Arc<AtomicU8>,
 ) -> Result<()> {
     let cfg = I2cConfig::new().baudrate(Hertz(100_000));
     let mut i2c = I2cDriver::new(i2c0, sda, scl, &cfg)?;
 
-    let mut led_ok = match set_led_ring(&mut i2c, false) {
+    let mut led_ok = match set_led_ring(&mut i2c, RingMode::Off, 0) {
         Ok(()) => {
-            info!("XVF3800 LED ring: off until VADNet speech");
+            info!("XVF3800 LED ring: off until recording");
             true
         }
         Err(e) => {
@@ -198,19 +158,13 @@ pub fn task(
         }
     };
 
-    let version = match read_version(&mut i2c) {
-        Ok(version) => {
-            info!(
-                "XVF3800 firmware v{}.{}.{}",
-                version[0], version[1], version[2]
-            );
-            Some(version)
-        }
-        Err(e) => {
-            warn!("XVF3800 firmware read failed: {e}; probing both DOA command layouts");
-            None
-        }
-    };
+    match read_version(&mut i2c) {
+        Ok(version) => info!(
+            "XVF3800 firmware v{}.{}.{}",
+            version[0], version[1], version[2]
+        ),
+        Err(e) => warn!("XVF3800 firmware read failed: {e}"),
+    }
 
     let mut routing_ok = match apply_routing(&mut i2c) {
         Ok(()) => {
@@ -223,156 +177,72 @@ pub fn task(
         }
     };
 
-    // DOA_VALUE was added in firmware v1.0.6.
-    let doa_supported = version.map_or(true, |v| (v[0], v[1], v[2]) >= (1, 0, 6));
-    let mut p = [0u8; 4];
-    let mut doa_cmd = None;
-    if doa_supported {
-        let preferred_cmd = match version {
-            Some(v) if (v[0], v[1], v[2]) < (1, 0, 8) => DOA_CMD_LEGACY,
-            _ => DOA_CMD,
-        };
-        let alternate_cmd = if preferred_cmd == DOA_CMD {
-            DOA_CMD_LEGACY
-        } else {
-            DOA_CMD
-        };
-        for cmd in [preferred_cmd, alternate_cmd] {
-            if xvf_read(&mut i2c, DOA_RESID, cmd, &mut p).is_ok() {
-                info!("XVF3800 DOA_VALUE read via cmd {}", cmd);
-                doa_cmd = Some(cmd);
-                break;
-            }
-        }
-        if doa_cmd.is_none() {
-            warn!(
-                "XVF3800 DOA_VALUE unavailable via cmd {preferred_cmd} and {alternate_cmd}; XVF speech flag disabled"
-            );
-        }
-    } else {
-        let v = version.unwrap_or([0; 3]);
-        info!(
-            "XVF3800 firmware v{}.{}.{} has no DOA_VALUE; XVF speech flag disabled",
-            v[0], v[1], v[2]
-        );
-    }
-    if doa_cmd.is_some() {
-        let doa = u16::from_le_bytes([p[0], p[1]]);
-        let speech = u16::from_le_bytes([p[2], p[3]]) != 0;
-        state.doa.store(doa as u32, Ordering::Relaxed);
-        state.speech.store(speech, Ordering::Relaxed);
-        state.ever_ok.store(true, Ordering::Relaxed);
-        state.last_ok_ms.store(now_ms(), Ordering::Relaxed);
-        state.polls.fetch_add(1, Ordering::Relaxed);
-    }
-
-    let mut energy = [0f32; 4];
-    let mut speech_via_energy = if doa_cmd.is_none() {
-        match read_speech_energy(&mut i2c, &mut energy) {
-            Ok(()) => {
-                let speech = energy.iter().any(|v| *v > 0.0);
-                state.speech.store(speech, Ordering::Relaxed);
-                state.ever_ok.store(true, Ordering::Relaxed);
-                state.last_ok_ms.store(now_ms(), Ordering::Relaxed);
-                state.polls.fetch_add(1, Ordering::Relaxed);
-                info!("XVF3800 speech energy enabled (AEC_SPENERGY_VALUES)");
-                true
-            }
-            Err(e) => {
-                warn!("XVF3800 speech energy unavailable: {e}; using ESP energy VAD");
-                false
-            }
-        }
-    } else {
-        false
-    };
-    let mut led_active = false;
+    let mut led_mode = RingMode::Off;
+    let mut led_level = 0u8;
+    let mut last_level_write = Instant::now();
     let mut last_led_retry = Instant::now();
-
-    let mut last_doa_log: Option<Instant> = None;
-    let mut last_poll_error_log: Option<Instant> = None;
     let mut last_routing_retry = Instant::now();
 
     loop {
-        if let Some(cmd) = doa_cmd {
-            match xvf_read(&mut i2c, DOA_RESID, cmd, &mut p) {
-                Ok(()) => {
-                    let doa = u16::from_le_bytes([p[0], p[1]]);
-                    let speech = u16::from_le_bytes([p[2], p[3]]) != 0;
-                    state.doa.store(doa as u32, Ordering::Relaxed);
-                    state.speech.store(speech, Ordering::Relaxed);
-                    state.ever_ok.store(true, Ordering::Relaxed);
-                    state.last_ok_ms.store(now_ms(), Ordering::Relaxed);
-                    state.polls.fetch_add(1, Ordering::Relaxed);
-
-                    if speech
-                        && last_doa_log
-                            .map_or(true, |t| t.elapsed() >= Duration::from_secs(5))
-                    {
-                        if doa > 359 {
-                            info!("XVF3800 speech doa=N/A");
-                        } else {
-                            info!("XVF3800 speech doa={} deg", doa);
-                        }
-                        last_doa_log = Some(Instant::now());
-                    }
-                }
-                Err(e) => {
-                    state.errors.fetch_add(1, Ordering::Relaxed);
-                    state.speech.store(false, Ordering::Relaxed);
-                    if last_poll_error_log
-                        .map_or(true, |t| t.elapsed() >= Duration::from_secs(5))
-                    {
-                        warn!("XVF3800 poll failed: {e}");
-                        last_poll_error_log = Some(Instant::now());
-                    }
-                }
+        let mode = if recording.load(Ordering::Relaxed) {
+            if ring_speech.load(Ordering::Relaxed) {
+                RingMode::Speech
+            } else {
+                RingMode::Hold
             }
-        } else if speech_via_energy {
-            match read_speech_energy(&mut i2c, &mut energy) {
-                Ok(()) => {
-                    let speech = energy.iter().any(|v| *v > 0.0);
-                    state.speech.store(speech, Ordering::Relaxed);
-                    state.ever_ok.store(true, Ordering::Relaxed);
-                    state.last_ok_ms.store(now_ms(), Ordering::Relaxed);
-                    state.polls.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    state.errors.fetch_add(1, Ordering::Relaxed);
-                    state.speech.store(false, Ordering::Relaxed);
-                    if last_poll_error_log
-                        .map_or(true, |t| t.elapsed() >= Duration::from_secs(5))
-                    {
-                        warn!("XVF3800 speech energy poll failed: {e}");
-                        last_poll_error_log = Some(Instant::now());
-                    }
-                    speech_via_energy = false;
-                    warn!("XVF3800 speech energy unavailable; using ESP energy VAD");
-                }
-            }
-        }
+        } else {
+            RingMode::Off
+        };
+        let brightness = match mode {
+            RingMode::Off => 0,
+            RingMode::Speech => ring_level.load(Ordering::Relaxed).max(config::RING_LEVEL_FLOOR),
+            RingMode::Hold => config::RING_HOLD_BRIGHTNESS,
+        };
 
-        let active = speech_active.load(Ordering::Relaxed);
-        if active != led_active {
+        if mode != led_mode {
             if led_ok {
-                match set_led_ring(&mut i2c, active) {
+                match set_led_ring(&mut i2c, mode, brightness) {
                     Ok(()) => {
-                        led_active = active;
-                        info!("XVF3800 LED ring: {}", if active { "on" } else { "off" });
+                        led_mode = mode;
+                        led_level = brightness;
+                        last_level_write = Instant::now();
+                        info!("XVF3800 LED ring: {}", mode.label());
                     }
                     Err(e) => {
                         warn!("XVF3800 LED update failed: {e}");
                         led_ok = false;
+                        led_mode = mode;
                         last_led_retry = Instant::now();
                     }
                 }
+            } else {
+                led_mode = mode;
             }
         } else if !led_ok && last_led_retry.elapsed() >= Duration::from_secs(1) {
-            if set_led_ring(&mut i2c, led_active).is_ok() {
+            if set_led_ring(&mut i2c, led_mode, brightness).is_ok() {
                 info!("XVF3800 LED ring control recovered");
                 led_ok = true;
+                led_level = brightness;
+                last_level_write = Instant::now();
             }
             last_led_retry = Instant::now();
+        } else if mode == RingMode::Speech
+            && led_ok
+            && brightness != led_level
+            && (brightness.abs_diff(led_level) >= LED_LEVEL_STEP
+                || last_level_write.elapsed() >= LED_LEVEL_INTERVAL)
+        {
+            match set_led_brightness(&mut i2c, brightness) {
+                Ok(()) => {
+                    led_level = brightness;
+                    last_level_write = Instant::now();
+                }
+                Err(e) => {
+                    warn!("XVF3800 LED brightness failed: {e}");
+                    led_ok = false;
+                    last_led_retry = Instant::now();
+                }
+            }
         }
 
         if !routing_ok && last_routing_retry.elapsed() >= Duration::from_secs(1) {
@@ -383,6 +253,6 @@ pub fn task(
             last_routing_retry = Instant::now();
         }
 
-        FreeRtos::delay_ms(100);
+        FreeRtos::delay_ms(50);
     }
 }

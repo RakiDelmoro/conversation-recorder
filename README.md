@@ -2,9 +2,9 @@
 
 Firmware for an XIAO ESP32-S3 Plus mounted on a Seeed reSpeaker XVF3800
 four-microphone array. The device performs always-on capture, gates speech with
-an on-device TEN VAD model, segments utterances, buffers unacknowledged audio
-in PSRAM, and streams 16 kHz mono PCM over the native USB CDC port to a host
-that owns STT and downstream knowledge-base processing.
+ESP-SR VADNet on the ESP32-S3, segments utterances, buffers unacknowledged
+audio in PSRAM, and streams 16 kHz mono PCM over the native USB CDC port to a
+host that owns STT and downstream knowledge-base processing.
 
 There is no Wi-Fi, TCP, or discovery path. The only transport is USB.
 
@@ -13,13 +13,13 @@ There is no Wi-Fi, TCP, or discovery path. The only transport is USB.
 ```mermaid
 flowchart LR
   X["XVF3800<br/>I2S master"] -->|"48 kHz stereo"| A["audio task"]
-  A -->|"16 kHz mono"| V["TEN VAD<br/>16 ms frames"]
+  A -->|"16 kHz mono"| V["ESP-SR VADNet"]
   V --> R["recorder"]
   A --> R
   R --> Q["PSRAM queue<br/>4 MB"]
   Q --> U["USB CDC transport"]
   U <-->|"START / AUDIO / END / ACK"| H["host ingest server"]
-  X -->|"I2C DoA + fallback"| R
+  R -->|"ring state"| L["XVF3800 LED ring"]
 ```
 
 Data path:
@@ -27,7 +27,7 @@ Data path:
 1. The XVF3800 provides a 48 kHz, 32-bit stereo I2S stream.
 2. The audio task extracts channel 0, converts to 16-bit mono, and resamples
    the measured input rate to 16 kHz.
-3. TEN VAD classifies 256-sample (16 ms) frames.
+3. ESP-SR VADNet classifies the 16 kHz mono stream.
 4. The recorder applies pre-roll, minimum-speech, holdback, and segment-cap
    rules, then queues `START`/`AUDIO`/`END` records.
 5. The USB transport drains the queue over the native USB port and frees slots
@@ -43,15 +43,14 @@ Data path:
 | `src/recorder.rs` | Segmentation state machine and queue producer |
 | `src/queue.rs` | Fixed-slot PSRAM ring with ACK-driven reclamation |
 | `src/usb.rs` | USB CDC transport and ACK/resume logic |
-| `src/xvf3800.rs` | I2C firmware probe, ASR routing, DoA polling |
-| `src/ten_vad_model.rs` | Rust FFI wrapper for the on-device VAD |
-| `src/ten_vad/` | Vendored TEN VAD C front end and model inference |
+| `src/xvf3800.rs` | I2C firmware probe, ASR routing, LED ring |
+| `src/vadnet.rs` | Rust wrapper for the ESP-SR VADNet bridge |
 | `src/protocol.rs` | Wire record encoding/decoding and ACK parser |
 | `src/config.rs` | Build-time configuration |
+| `components/vadnet_bridge/` | ESP-SR VADNet bridge and model partition setup |
 | `audio-receiver/receiver.py` | USB serial receiver, WAV writer, and ACKs |
 | `audio-receiver/test_receiver.py` | USB serial integration tests |
-| `audio-receiver/README.md` | Host receiver usage |
-| `tools/export_ten_vad_weights.py` | Regenerates the C weight header from ONNX |
+| `audio-receiver/README.md` | Receiver usage, Windows, and Docker |
 
 ## Prerequisites
 
@@ -92,8 +91,8 @@ Artifact:
 target/xtensa-esp32s3-espidf/release/conversation-recorder
 ```
 
-The first build compiles ESP-IDF through `esp-idf-sys` and takes several
-minutes. Use `cargo build -vv` for progress.
+The first build compiles ESP-IDF and ESP-SR through `esp-idf-sys` and takes
+several minutes. Use `cargo build -vv` for progress.
 
 The devcontainer uses `espressif/idf-rust:all_latest`. `.cargo/config.toml`
 sets `ESP_IDF_TOOLS_INSTALL_DIR = "fromenv"` because the image activates an
@@ -121,16 +120,18 @@ All build-time settings live in `src/config.rs`.
 |---|---|---|
 | `I2S_RATE` | `48_000` | 48 kHz master image |
 | `I2S_SLAVE` | `true` | XVF3800 drives BCLK/WS |
-| `I2S_BITS` | `16` | Slot width: 16 for v1.0.5 master, 32 for v1.0.9 |
+| `I2S_BITS` | `32` | Slot width: 16 for v1.0.5 master, 32 for v1.0.9 |
 | `I2S_CHANNEL` | `0` | Routed ASR lane; use `1` for the default right ASR lane |
-| `TEN_VAD_THRESHOLD` | `0.35` | Start threshold; higher rejects more non-speech |
-| `TEN_VAD_CONTINUE_THRESHOLD` | `0.20` | Keepalive threshold once a segment is active |
-| `REQUIRE_XVF_SPEECH` | `false` | Require XVF speech agreement to start when the XVF is healthy; leave off for v1.0.5 |
-| `USE_TEN_VAD` | `false` | Use XVF3800 speech flag/DoA; enable for TEN VAD |
 | `MIN_SPEECH_MS` | `600` | Speech required in the rolling 2 s window |
 | `PRE_ROLL_MS` | `3_000` | Audio retained before trigger |
 | `LOG_ONLY` | `false` | Set `true` for log-only simulation; `false` sends audio |
 | `HOLDBACK_MS` | `1_500` | Trailing audio queued after speech |
+| `RING_SPEECH_HOLD_MS` | `400` | Keep the XVF ring blue this long after speech stops, then green |
+| `RING_LEVEL_MIN_DBFS` | `-50.0` | Lower end of the speech-level-to-brightness map |
+| `RING_LEVEL_MAX_DBFS` | `-12.0` | Upper end of the speech-level-to-brightness map |
+| `RING_LEVEL_FLOOR` | `40` | Minimum ring brightness while speech is active |
+| `RING_LEVEL_RELEASE` | `0.80` | Per-10 ms brightness decay when the level falls |
+| `RING_HOLD_BRIGHTNESS` | `128` | Green hold-state brightness |
 | `SILENCE_TIMEOUT_MS` | `60_000` | Conversation ends after this much silence |
 | `SEGMENT_MS` | `1_800_000` | Hard cap for continuous speech |
 | `ONE_SHOT` | `false` | One-shot test mode; false uses VAD segmentation |
@@ -153,15 +154,15 @@ espflash write-bin 0x8000 firmware-assets/partition-table.bin --chip esp32s3
 ```
 
 The table must define `factory` at `0x10000` (4 MB) and `model` at
-`0x400000` (3 MB).
+`0x400000` (3 MB). `firmware-assets/` ships the matching `srmodels.bin`
+(`CONFIG_SR_VADN_VADNET1_MEDIUM=y`) and partition table.
 
 Expected boot and runtime logs:
 
 ```text
 XVF3800 firmware v1.0.9
 I2S configured 48000 Hz, observed 4799x Hz
-XVF3800 DOA_VALUE read via cmd 18
-vadnet: VADNet vadnet1_medium ready: chunk=... rate=16000
+vadnet: VADNet vadnet1_medium ready: chunk=... rate=16000 energy=-40.0 dBFS
 usb: host attached
 ```
 
@@ -188,10 +189,8 @@ XVF parameters are volatile across reset. The firmware reapplies
 writes are rejected, set `I2S_CHANNEL = 1` to use the firmware's default
 right-channel ASR output.
 
-`DOA_VALUE` moved from command 19 to 18 in I2S firmware v1.0.8. The firmware
-reads the version and selects the matching command, falling back to a probe if
-the version read fails. Firmware older than v1.0.6 has no `DOA_VALUE` command;
-TEN VAD still drives segmentation.
+The firmware version is logged at boot. Speech detection does not depend on
+XVF firmware features; VADNet runs entirely on the ESP32-S3.
 
 ### Pinout
 
@@ -212,9 +211,10 @@ XVF3800 I2C address: `0x2C`.
 
 ### Speech detection
 
-- TEN VAD runs on 256-sample, 16 ms frames at 16 kHz. Its 302 KB of weights
-  are placed in PSRAM (`CONFIG_SPIRAM_RODATA`) and the CPU runs at 240 MHz;
-  with the weights in 40 MHz DIO flash it needed ~39 ms per 20 ms block.
+- ESP-SR VADNet (`vadnet1_medium`) runs on the ESP32-S3 and classifies the
+  16 kHz mono stream. Its model is loaded from the `model` flash partition.
+- VADNet is the only speech gate. If it fails to initialize, the audio task
+  exits with an error instead of falling back to XVF or energy heuristics.
 - A segment is committed after 600 ms of speech in a rolling 2 s window. Short
   gaps do not reset the window, so normal speech with plosives and pauses still
   triggers while a clap does not. The 3 s pre-roll is the candidate buffer: it
@@ -222,16 +222,9 @@ XVF3800 I2C address: `0x2C`.
 - Before sending, the candidate pre-roll is checked for active duration and
   envelope peaks. A clap/short transient is rejected on-device and never
   queued; the LED stays in its idle pattern.
-- When the XVF3800 is healthy and `REQUIRE_XVF_SPEECH` is set, its speech flag
-  must agree with TEN VAD before a segment starts. If the XVF is unavailable,
-  TEN VAD decides alone.
 - The task measures the actual I2S rate over the first two seconds and
   resamples that rate to 16 kHz. A nominal 48 kHz stream is still resampled
   with the same fractional phase accumulator.
-- If TEN VAD initialization fails, the recorder falls back to the XVF3800
-  `DOA_VALUE` speech flag on firmware v1.0.6+, then to `AEC_SPENERGY_VALUES`,
-  then to an ESP energy VAD.
-- Set `USE_TEN_VAD = false` to bypass the model and use the XVF speech energy.
 
 ### Segmentation
 
@@ -273,9 +266,27 @@ boundary. The first segment's cap includes the pre-roll window.
 The XIAO status LED follows the open/closed segment, not instantaneous speech. It
 stays solid through the 60 s silence wait and turns off when `END` is queued.
 
-The XVF3800 LED ring is separate: it is off while VADNet reports non-speech and
-solid green while VADNet reports speech. The XVF DoA animation is disabled, so
-the ring no longer reacts to every sound independently of the recorder.
+The XVF3800 LED ring reflects the recorder's session state, not per-block
+VADNet output:
+
+| Ring | Meaning |
+|---|---|
+| Off | No session open |
+| Pulsing blue (VU) | Session committed; speech is being recorded |
+| Solid green | Session still open, waiting for more speech (up to 60 s) |
+
+While VADNet reports speech, the blue brightness tracks the microphone RMS
+level with a fast attack and `RING_LEVEL_RELEASE` decay, so the ring visibly
+breathes/pulses with the voice. This is amplitude, not VADNet confidence: the
+model only returns speech/non-speech. The XVF task polls every 50 ms and writes
+brightness only when it changes, so the I2C bus is idle between updates. After
+`RING_SPEECH_HOLD_MS` (400 ms) without speech, the ring switches to solid green
+and stays green through the 60 s silence timeout until `END`. Because the ring
+follows the recorder, claps/noise rejected by the candidate check do not light
+it. Expect ~0.6-0.7 s from speech onset to blue: the commit needs
+`MIN_SPEECH_MS` (600 ms), plus a 10 ms block and the XVF task's 50 ms poll.
+Utterances shorter than that window never open a segment, so they never light
+the ring.
 
 The XIAO LED turns on only after the recorder has confirmed a segment start, i.e.
 after `MIN_SPEECH_MS` of speech that passed the start gate. A short clap or
@@ -287,14 +298,14 @@ The device enumerates as a USB CDC serial device and streams the same records
 used by the previous TCP path. On the host:
 
 ```sh
-python3 audio-receiver/receiver.py --serial /dev/ttyACM0 --out recordings
+python3 audio-receiver/receiver.py --serial /dev/ttyACM0
 ```
 
 On Windows, install pyserial and use the COM port:
 
 ```powershell
 python -m pip install -r audio-receiver\requirements.txt
-python audio-receiver\receiver.py --serial COM3 --out recordings
+python audio-receiver\receiver.py --serial COM3
 ```
 
 Behavior:
@@ -345,7 +356,7 @@ ACK header flag bit 0 marks the final ACK sent after `END`.
 | Receiver stops | Device keeps queueing; reconnect resumes from last ACK |
 | Queue overflow | Current segment ends with `reason 1` |
 | XVF I2S firmware absent | No usable I2S clock/data; rate check logs failure |
-| TEN VAD init failure | Falls back to XVF speech flag, then energy VAD |
+| VADNet model missing | VADNet init fails; audio task exits with an error |
 
 ## Security
 
@@ -373,42 +384,24 @@ python3 audio-receiver/test_receiver.py -v
 The tests use a PTY to cover START/AUDIO/END ingestion, WAV correctness,
 console-text resync, and resume after a link drop.
 
-TEN VAD port validation: the C implementation was compared against the
-upstream TEN VAD library on a 720-frame speech file. Maximum absolute
-probability difference was `7e-4`, mean `7e-5`.
+## On-device VAD
 
-## On-device VAD model
+VADNet comes from Espressif's ESP-SR component (`espressif/esp-sr` 2.6.2,
+`CONFIG_SR_VADN_VADNET1_MEDIUM`). `components/vadnet_bridge/` wraps the
+ESP-SR VAD interface, buffers 16 kHz mono audio into the model's expected chunk
+size, and returns a speech/non-speech verdict per chunk.
 
-The firmware vendors an ONNX-Runtime-free port of
-[TEN VAD](https://github.com/TEN-framework/ten-vad):
-
-- 309 KB ONNX model; 302 KB float32 weights in flash.
-- 3 × 41 mel/pitch context, separable convolution front end, two 64-unit
-  LSTMs, and a 128→32→1 dense head.
-- 16 kHz, 256-sample hop, probability output.
-- Upstream C front end retained: STFT, mel filterbank, pitch, scoring.
-- ONNX Runtime replaced by `src/ten_vad/aivad_model.c`.
-- Weights regenerated with `python3 tools/export_ten_vad_weights.py`.
-
-TEN VAD is a speech/non-speech classifier. It rejects most steady noise,
-cat/dog sounds, and instrumental music, but it is not a human-voice or source
+VADNet is a speech/non-speech classifier. It rejects most steady noise, cat/dog
+sounds, and instrumental music, but it is not a human-voice or source
 classifier. TV, podcasts, other people, and songs with vocals are human speech
-and will pass. This is intentional for this recorder. Tune
-`TEN_VAD_THRESHOLD` against representative recordings.
+and will pass. This is intentional for this recorder.
 
 ## Known limitations
 
 - No persistent local storage; unacknowledged audio lives only in PSRAM.
 - USB only; no Wi-Fi, TCP, or discovery.
 - WAV files on the host are plaintext.
-- TEN VAD only meets the 16 ms budget with its weights in PSRAM and the CPU
-  at 240 MHz. Verify the `TEN VAD: ... us per 20 ms block` log on your build.
+- The `model` partition and `srmodels.bin` must match the firmware; a missing
+  model stops the audio task at boot.
 - The XVF3800 must run a matching I2S firmware image.
 - The receiver holds the tty open; stop it before flashing.
-
-## Licensing
-
-The vendored TEN VAD sources are Copyright © 2025 Agora and are licensed under
-the Apache License 2.0 with additional conditions. See
-`src/ten_vad/LICENSE` and `src/ten_vad/NOTICES`. Review those terms before
-commercial deployment.

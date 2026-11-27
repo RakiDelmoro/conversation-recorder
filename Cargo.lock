@@ -243,7 +243,6 @@ name = "conversation-recorder"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cc",
  "embuild",
  "esp-idf-hal",
  "esp-idf-svc",

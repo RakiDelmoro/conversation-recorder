@@ -1,6 +1,6 @@
 //! I2S capture from the XVF3800 and 48 kHz -> 16 kHz decimation.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,9 +17,7 @@ use log::{error, info, warn};
 use crate::config;
 use crate::queue::SharedQueue;
 use crate::recorder::Recorder;
-use crate::ten_vad_model::TenVad;
 use crate::vadnet::VadNet;
-use crate::xvf3800::VadState;
 
 const RATE_CHECK_MS: u64 = 2_000;
 
@@ -77,6 +75,44 @@ struct LowPass {
     fc: f64,
 }
 
+/// Maps the speech envelope to an LED brightness with fast attack and a slow
+/// release, so the ring pulses with speech instead of flickering per block.
+struct LevelMeter {
+    env: f32,
+}
+
+impl LevelMeter {
+    fn new() -> Self {
+        Self { env: 0.0 }
+    }
+
+    fn process(&mut self, pcm: &[i16]) -> u8 {
+        if pcm.is_empty() {
+            return config::RING_LEVEL_FLOOR;
+        }
+        let mut sum = 0.0f64;
+        for &s in pcm {
+            let v = s as f64;
+            sum += v * v;
+        }
+        let rms = (sum / pcm.len() as f64).sqrt();
+        let db = 20.0 * (rms / 32768.0).max(1e-9).log10() as f32;
+        let span = config::RING_LEVEL_MAX_DBFS - config::RING_LEVEL_MIN_DBFS;
+        let target =
+            ((db - config::RING_LEVEL_MIN_DBFS) / span).clamp(0.0, 1.0);
+        self.env = if target > self.env {
+            target
+        } else {
+            self.env * config::RING_LEVEL_RELEASE
+        };
+        let floor = config::RING_LEVEL_FLOOR as f32;
+        let ceil = config::RING_LEVEL_CEIL as f32;
+        (floor + self.env * (ceil - floor))
+            .round()
+            .clamp(0.0, 255.0) as u8
+    }
+}
+
 impl LowPass {
     fn new(fs: f64, fc: f64) -> Self {
         Self {
@@ -105,14 +141,21 @@ pub fn task(
     bclk: Gpio8,
     ws: Gpio7,
     din: Gpio43,
-    vad: Arc<VadState>,
     shared: Arc<SharedQueue>,
     recording: Arc<AtomicBool>,
     audio_ok: Arc<AtomicBool>,
     acked: Arc<AtomicBool>,
     restart: Arc<AtomicBool>,
-    speech_active: Arc<AtomicBool>,
+    ring_speech: Arc<AtomicBool>,
+    ring_level: Arc<AtomicU8>,
 ) -> Result<()> {
+    let mut vadnet = match VadNet::new() {
+        Some(vad) => vad,
+        None => anyhow::bail!(
+            "VADNet init failed; check the model partition and srmodels.bin"
+        ),
+    };
+
     let bits = match config::I2S_BITS {
         16 => DataBitWidth::Bits16,
         32 => DataBitWidth::Bits32,
@@ -142,42 +185,17 @@ pub fn task(
     i2s.rx_enable()?;
     audio_ok.store(true, Ordering::Relaxed);
 
-    let mut model = if config::USE_TEN_VAD && !config::ONE_SHOT {
-        let model = TenVad::new(config::TEN_VAD_THRESHOLD);
-        if model.is_some() {
-            info!(
-                "TEN VAD model ready (threshold {})",
-                config::TEN_VAD_THRESHOLD
-            );
-        } else {
-            error!("TEN VAD init failed; falling back to XVF3800 VAD");
-        }
-        model
-    } else {
-        info!("TEN VAD disabled; using XVF3800 speech energy");
-        None
-    };
-    let mut recorder = Recorder::new(recording, model.is_some(), acked, restart, speech_active)?;
-    let mut vadnet = if config::USE_VADNET {
-        let vad = VadNet::new();
-        if vad.is_none() {
-            error!("VADNet init failed; falling back to XVF/energy gate");
-        }
-        vad
-    } else {
-        None
-    };
+    let mut recorder = Recorder::new(recording, acked, restart, ring_speech)?;
 
     let mut raw = vec![0u8; (config::I2S_RATE as usize / 50) * frame_bytes];
     let mut mono = [0i16; 960];
     let mut input_rate = config::I2S_RATE as f64;
     let mut lowpass = LowPass::new(input_rate, 7_200.0);
+    let mut meter = LevelMeter::new();
     let mut resample_t = 0.0f64;
     let mut last_error_log: Option<Instant> = None;
     let mut rate_start: Option<(Instant, u64)> = None;
     let mut rate_checked = false;
-    let mut vad_time_us: u64 = 0;
-    let mut vad_blocks: u32 = 0;
 
     loop {
         let n = match i2s.read(
@@ -276,35 +294,9 @@ pub fn task(
         }
 
         if n_out > 0 {
-            let started = Instant::now();
-            let model_probability = match model.as_mut() {
-                Some(model) => model.push(&mono[..n_out]),
-                None => 0.0,
-            };
-            if model.is_some() {
-                vad_time_us += started.elapsed().as_micros() as u64;
-                vad_blocks += 1;
-                if vad_blocks >= 1_500 {
-                    info!(
-                        "TEN VAD: {} us per 20 ms block ({} blocks)",
-                        vad_time_us / vad_blocks as u64,
-                        vad_blocks
-                    );
-                    vad_time_us = 0;
-                    vad_blocks = 0;
-                }
-            }
-            let vadnet_speech = match vadnet.as_mut() {
-                Some(v) => Some(v.push(&mono[..n_out])),
-                None => None,
-            };
-            recorder.process(
-                &mono[..n_out],
-                &vad,
-                &shared,
-                model_probability,
-                vadnet_speech,
-            );
+            ring_level.store(meter.process(&mono[..n_out]), Ordering::Relaxed);
+            let vadnet_speech = vadnet.push(&mono[..n_out]);
+            recorder.process(&mono[..n_out], &shared, vadnet_speech);
         }
     }
 }

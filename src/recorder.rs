@@ -1,5 +1,5 @@
 //! Adaptive recorder: speech-triggered, silence-ended utterances with a
-//! hard 60 s cap for continuous speech.
+//! hard 30 min cap for continuous speech.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,8 +8,6 @@ use log::{error, info, warn};
 
 use crate::config;
 use crate::queue::SharedQueue;
-use crate::vad::EnergyVad;
-use crate::xvf3800::VadState;
 
 const SAMPLE_RATE: u64 = 16_000;
 const MAX_CHUNK: usize = 1600;
@@ -42,6 +40,7 @@ pub struct Recorder {
     speech_hist_pos: usize,
     speech_hist_count: usize,
     silence_run_ms: u32,
+    ring_silence_ms: u32,
     active_speech_ms: u32,
     emit_open: bool,
     pre_roll: Vec<i16>,
@@ -50,9 +49,6 @@ pub struct Recorder {
     pre_roll_pos: usize,
     pending: [i16; MAX_CHUNK],
     pending_len: usize,
-    energy: EnergyVad,
-    use_model: bool,
-    degraded: bool,
     queue_failed: bool,
     queue_error_logged_ms: i64,
     cooldown_until_ms: i64,
@@ -62,16 +58,15 @@ pub struct Recorder {
     acked: Arc<AtomicBool>,
     restart: Arc<AtomicBool>,
     recording: Arc<AtomicBool>,
-    speech_active: Arc<AtomicBool>,
+    ring_speech: Arc<AtomicBool>,
 }
 
 impl Recorder {
     pub fn new(
         recording: Arc<AtomicBool>,
-        use_model: bool,
         acked: Arc<AtomicBool>,
         restart: Arc<AtomicBool>,
-        speech_active: Arc<AtomicBool>,
+        ring_speech: Arc<AtomicBool>,
     ) -> anyhow::Result<Box<Self>> {
         let cap = config::PRE_ROLL_MS as usize * 16;
         let mut pre_roll = Vec::new();
@@ -98,6 +93,7 @@ impl Recorder {
             speech_hist_pos: 0,
             speech_hist_count: 0,
             silence_run_ms: 0,
+            ring_silence_ms: 0,
             active_speech_ms: 0,
             emit_open: false,
             pre_roll,
@@ -106,9 +102,6 @@ impl Recorder {
             pre_roll_pos: 0,
             pending: [0; MAX_CHUNK],
             pending_len: 0,
-            energy: EnergyVad::new(),
-            use_model,
-            degraded: false,
             queue_failed: false,
             queue_error_logged_ms: i64::MIN / 2,
             cooldown_until_ms: 0,
@@ -118,64 +111,23 @@ impl Recorder {
             acked,
             restart,
             recording,
-            speech_active,
+            ring_speech,
         }))
     }
 
-    pub fn process(
-        &mut self,
-        pcm: &[i16],
-        vad: &VadState,
-        shared: &SharedQueue,
-        model_probability: f32,
-        vadnet_speech: Option<bool>,
-    ) {
+    fn publish_led(&self) {
+        let recording = matches!(self.state, State::Active);
+        self.recording.store(recording, Ordering::Relaxed);
+        self.ring_speech.store(
+            recording && self.ring_silence_ms < config::RING_SPEECH_HOLD_MS,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn process(&mut self, pcm: &[i16], shared: &SharedQueue, speech: bool) {
         if config::ONE_SHOT {
             self.process_one_shot(pcm, shared);
             return;
-        }
-
-        let snap = vad.snapshot();
-        let xvf_speech = snap.healthy && snap.speech;
-        let speech = if self.use_model {
-            match &self.state {
-                // A start needs both a strong model score and, when available,
-                // agreement from the XVF3800 speech flag. This keeps claps and
-                // short noise bursts from opening a recording.
-                State::Idle => {
-                    model_probability >= config::TEN_VAD_THRESHOLD
-                        && (!config::REQUIRE_XVF_SPEECH || !snap.healthy || xvf_speech)
-                }
-                // Once active, a lower threshold plus the XVF flag keeps
-                // natural pauses from ending the segment early.
-                State::Active => {
-                    model_probability >= config::TEN_VAD_CONTINUE_THRESHOLD
-                        || (config::REQUIRE_XVF_SPEECH && xvf_speech)
-                }
-            }
-        } else if let Some(vadnet) = vadnet_speech {
-            // VADNet is the primary gate when the model is available.
-            vadnet
-        } else {
-            // Fallback if the model partition or bridge failed.
-            let energy_speech = self.energy.process(pcm);
-            if snap.healthy {
-                xvf_speech && energy_speech
-            } else {
-                energy_speech
-            }
-        };
-
-        self.speech_active.store(speech, Ordering::Relaxed);
-
-        if !self.use_model {
-            if !snap.healthy && !self.degraded {
-                warn!("XVF3800 I2C unhealthy; using energy VAD fallback");
-                self.degraded = true;
-            } else if snap.healthy && self.degraded {
-                info!("XVF3800 I2C recovered");
-                self.degraded = false;
-            }
         }
 
         self.push_pre_roll(pcm);
@@ -203,8 +155,8 @@ impl Recorder {
                 let accepted = stats.active_ms >= config::CANDIDATE_MIN_ACTIVE_MS
                     && (stats.peaks >= 2 || stats.active_ms >= CANDIDATE_LONG_ACTIVE_MS);
                 info!(
-                    "recorder: candidate check active={} ms, zcr={:.2}, peaks={}, run={} ms, vad={:.2}, xvf={}",
-                    stats.active_ms, stats.zcr, stats.peaks, self.speech_run_ms, model_probability, xvf_speech
+                    "recorder: candidate check active={} ms, zcr={:.2}, peaks={}, run={} ms",
+                    stats.active_ms, stats.zcr, stats.peaks, self.speech_run_ms
                 );
                 if !accepted {
                     warn!(
@@ -214,20 +166,20 @@ impl Recorder {
                     self.reset_speech_window();
                     self.cooldown_until_ms = now_ms as i64 + 1000;
                     self.input_samples += pcm.len() as u64;
-                    self.recording.store(false, Ordering::Relaxed);
+                    self.publish_led();
                     return;
                 }
 
                 if config::LOG_ONLY {
                     info!(
-                        "recorder: candidate accepted (log-only) active={} ms, zcr={:.2}, peaks={}, vad={:.2}, run={} ms, xvf={}",
-                        stats.active_ms, stats.zcr, stats.peaks, model_probability, self.speech_run_ms, xvf_speech
+                        "recorder: candidate accepted (log-only) active={} ms, zcr={:.2}, peaks={}, run={} ms",
+                        stats.active_ms, stats.zcr, stats.peaks, self.speech_run_ms
                     );
                     self.log_simulated_session(stats.active_ms);
                     self.reset_speech_window();
                     self.cooldown_until_ms = now_ms as i64 + 1000;
                     self.input_samples += pcm.len() as u64;
-                    self.recording.store(false, Ordering::Relaxed);
+                    self.publish_led();
                     return;
                 }
 
@@ -244,6 +196,7 @@ impl Recorder {
                     let pre_roll_ms = self.pre_roll_len as u64 * 1000 / SAMPLE_RATE;
                     self.window_start_ms = now_ms.saturating_sub(pre_roll_ms);
                     self.silence_run_ms = 0;
+                    self.ring_silence_ms = 0;
                     self.active_speech_ms = 0;
                     self.emit_open = true;
                     self.pending_len = 0;
@@ -252,10 +205,7 @@ impl Recorder {
                     if !self.emit_pre_roll(shared) || self.queue_failed {
                         self.recorder_end(1, shared);
                     } else {
-                        info!(
-                            "session 0x{:08x} started (doa={}, vad={:.2}, xvf={})",
-                            self.session_id, snap.doa, model_probability, xvf_speech
-                        );
+                        info!("session 0x{:08x} started", self.session_id);
                     }
                 } else if now_ms as i64 - self.queue_error_logged_ms >= 1000 {
                     error!("recorder: cannot queue session start");
@@ -265,16 +215,17 @@ impl Recorder {
                 }
 
                 self.input_samples += pcm.len() as u64;
-                self.recording.store(false, Ordering::Relaxed);
+                self.publish_led();
                 return;
             }
 
             self.input_samples += pcm.len() as u64;
-            self.recording.store(false, Ordering::Relaxed);
+            self.publish_led();
             return;
         }
 
         if speech {
+            self.ring_silence_ms = 0;
             self.active_speech_ms = self.active_speech_ms.saturating_add(block_ms);
             if self.active_speech_ms >= config::SPEECH_RESUME_MS {
                 self.silence_run_ms = 0;
@@ -284,13 +235,14 @@ impl Recorder {
         } else {
             self.active_speech_ms = 0;
             self.silence_run_ms = self.silence_run_ms.saturating_add(block_ms);
+            self.ring_silence_ms = self.ring_silence_ms.saturating_add(block_ms);
         }
 
         if self.silence_run_ms <= config::HOLDBACK_MS {
             if !self.emit_audio(pcm, shared) {
                 self.recorder_end(1, shared);
                 self.input_samples += pcm.len() as u64;
-                self.recording.store(false, Ordering::Relaxed);
+                self.publish_led();
                 return;
             }
         } else if self.emit_open {
@@ -299,7 +251,7 @@ impl Recorder {
             if !flushed {
                 self.recorder_end(1, shared);
                 self.input_samples += pcm.len() as u64;
-                self.recording.store(false, Ordering::Relaxed);
+                self.publish_led();
                 return;
             }
         }
@@ -317,15 +269,13 @@ impl Recorder {
         }
 
         self.input_samples += pcm.len() as u64;
-        self.recording
-            .store(matches!(self.state, State::Active), Ordering::Relaxed);
+        self.publish_led();
     }
 
     fn process_one_shot(&mut self, pcm: &[i16], shared: &SharedQueue) {
+        self.ring_speech.store(false, Ordering::Relaxed);
         let len = pcm.len() as u64;
         let now_ms = (self.input_samples + len) * 1000 / SAMPLE_RATE;
-        self.speech_active
-            .store(!self.one_shot_done, Ordering::Relaxed);
 
         if self.one_shot_done {
             if self.acked.load(Ordering::Relaxed) {
@@ -616,7 +566,7 @@ impl Recorder {
         if !shared.push_end(old_id, old_total, 2) {
             error!("recorder: cannot queue segment end");
             self.state = State::Idle;
-            self.recording.store(false, Ordering::Relaxed);
+            self.publish_led();
             self.cooldown_until_ms = now_ms as i64 + 1000;
             self.clear_pre_roll();
             return;
@@ -634,7 +584,8 @@ impl Recorder {
             self.pending_len = 0;
             self.emit_open = true;
             self.queue_failed = false;
-            self.recording.store(true, Ordering::Relaxed);
+            self.ring_silence_ms = 0;
+            self.publish_led();
             info!(
                 "recorder: segment 0x{:08x} ended at {} samples; next 0x{:08x}",
                 old_id, old_total, self.session_id
@@ -648,8 +599,9 @@ impl Recorder {
         self.queue_failed = false;
         self.emit_open = false;
         self.silence_run_ms = 0;
+        self.ring_silence_ms = 0;
         self.cooldown_until_ms = now_ms as i64 + 1000;
-        self.recording.store(false, Ordering::Relaxed);
+        self.publish_led();
         self.clear_pre_roll();
     }
 
@@ -679,12 +631,13 @@ impl Recorder {
 
         self.reset_speech_window();
         self.silence_run_ms = 0;
+        self.ring_silence_ms = 0;
         self.active_speech_ms = 0;
         self.pending_len = 0;
         self.queue_failed = false;
         self.emit_open = false;
         self.cooldown_until_ms = (self.input_samples * 1000 / SAMPLE_RATE) as i64 + 1000;
-        self.recording.store(false, Ordering::Relaxed);
+        self.publish_led();
         self.clear_pre_roll();
     }
 }

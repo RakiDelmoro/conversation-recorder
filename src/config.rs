@@ -10,13 +10,25 @@ pub const SILENCE_TIMEOUT_MS: u64 = 60_000;
 /// Pre-roll keeps the audio before the trigger point.
 pub const MIN_SPEECH_MS: u32 = 600;
 /// Speech must persist this long before it resets the silence timer while a
-/// segment is active. This rejects isolated noise blocks that flicker above
-/// the energy floor.
+/// segment is active. This rejects isolated non-speech blocks.
 pub const SPEECH_RESUME_MS: u32 = 300;
 pub const PRE_ROLL_MS: u32 = 3_000;
 /// Candidate must contain at least this much active audio before it is sent.
 pub const CANDIDATE_MIN_ACTIVE_MS: u32 = 500;
 pub const HOLDBACK_MS: u32 = 1_500;
+/// Keep the ring blue this long after the last speech block inside an open
+/// segment, then switch to green for the silence wait.
+pub const RING_SPEECH_HOLD_MS: u32 = 400;
+/// Microphone level range mapped to ring brightness while speech is active.
+pub const RING_LEVEL_MIN_DBFS: f32 = -50.0;
+pub const RING_LEVEL_MAX_DBFS: f32 = -12.0;
+/// Brightness floor/ceiling for the speech VU, 0-255.
+pub const RING_LEVEL_FLOOR: u8 = 40;
+pub const RING_LEVEL_CEIL: u8 = 255;
+/// Per-10 ms-block brightness decay when the level drops, 0.0-1.0.
+pub const RING_LEVEL_RELEASE: f32 = 0.80;
+/// Fixed brightness for the green hold state.
+pub const RING_HOLD_BRIGHTNESS: u8 = 128;
 pub const SEGMENT_MS: u64 = 1_800_000;
 pub const QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -26,22 +38,6 @@ pub const ONE_SHOT: bool = false;
 pub const ONE_SHOT_MS: u64 = 60_000;
 pub const ONE_SHOT_ACK_TIMEOUT_MS: u64 = 5_000;
 
-/// Start threshold. Higher values reject more non-speech but can miss quiet
-/// speech. The same value is passed to the TEN VAD model.
-pub const TEN_VAD_THRESHOLD: f32 = 0.35;
-/// Once a segment is active, keep it alive at a lower threshold so natural
-/// pauses in speech do not chop the recording.
-pub const TEN_VAD_CONTINUE_THRESHOLD: f32 = 0.20;
-/// When the XVF3800 is healthy, require its speech flag to agree before
-/// starting a segment. Firmware v1.0.5 has no DOA_VALUE, so its fallback is
-/// only raw speech energy and is not a reliable VAD; leave this off there.
-pub const REQUIRE_XVF_SPEECH: bool = false;
-/// TEN VAD weights are moved to PSRAM (CONFIG_SPIRAM_RODATA) and the CPU runs
-/// at 240 MHz. If the measured cost is still above 20 ms per block, set this
-/// to false to use the XVF3800 speech energy instead.
-pub const USE_TEN_VAD: bool = false;
-/// Use ESP-SR VADNet as an independent speech veto.
-pub const USE_VADNET: bool = true;
 /// Test mode: log accepted/rejected candidates but never queue or send audio.
 pub const LOG_ONLY: bool = false;
 
