@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """USB CDC ingest server for the conversation-recorder firmware.
 
-Reads START/AUDIO/END records from a raw tty, writes one 16-bit PCM WAV per
-segment, and acknowledges received sample counts so the device can resume
-after a link loss. The ESP-IDF console shares the tty, so the framer resyncs
-past log lines by scanning for the record magic.
+Reads START/AUDIO/END records from a raw tty or Windows COM port, writes one
+16-bit PCM WAV per segment, and acknowledges received sample counts so the
+device can resume after a link loss. The ESP-IDF console shares the port, so
+the framer resyncs past log lines by scanning for the record magic.
+
+On Windows, install pyserial first:
+
+    python -m pip install -r requirements.txt
+    python receiver.py --serial COM3 --out recordings
 """
 
 import argparse
@@ -144,6 +149,7 @@ class Session:
     bits: int
     received: int = 0
     last_activity: float = field(default_factory=time.monotonic)
+    last_report: float = 0.0
     active: bool = True
     finalized: bool = False
 
@@ -187,6 +193,16 @@ class IngestServer:
                 ):
                     session.last_activity = now
                     self._finalize(session)
+
+    def _write_header(self, session: Session) -> None:
+        data_bytes = session.received * session.sample_bytes
+        pos = session.file.tell()
+        session.file.seek(0)
+        session.file.write(
+            wav_header(session.rate, session.channels, session.bits, data_bytes)
+        )
+        session.file.flush()
+        session.file.seek(pos)
 
     def _finalize(self, session: Session) -> None:
         if session.finalized:
@@ -291,8 +307,29 @@ class IngestServer:
                         current = None
                         continue
                     if existing is not None and existing.active:
-                        log.error("START for already-active session %s", key)
-                        break
+                        if first_sample > existing.received:
+                            log.error(
+                                "reject duplicate START gap for %s: first=%d received=%d",
+                                key,
+                                first_sample,
+                                existing.received,
+                            )
+                            break
+                        if first_sample < existing.received:
+                            offset = 44 + first_sample * existing.sample_bytes
+                            existing.file.seek(offset)
+                            existing.file.truncate(offset)
+                            existing.received = first_sample
+                        existing.active = True
+                        existing.last_activity = time.monotonic()
+                        current = existing
+                        log.info(
+                            "duplicate START for active %s; resuming at sample %d",
+                            key,
+                            existing.received,
+                        )
+                        await self._send_ack(writer, session_id, existing.received)
+                        continue
 
                     if existing is None:
                         if first_sample != 0:
@@ -342,8 +379,11 @@ class IngestServer:
 
                 elif typ == TYPE_AUDIO:
                     if current is None or current.finalized:
-                        log.error("AUDIO without active session from %s", peer)
-                        break
+                        log.warning(
+                            "AUDIO without active session from %s; waiting for START",
+                            peer,
+                        )
+                        continue
                     if not current.active:
                         log.error("AUDIO for inactive session %s", current.key)
                         break
@@ -355,6 +395,21 @@ class IngestServer:
                     current.file.flush()
                     current.received += len(payload) // current.sample_bytes
                     current.last_activity = time.monotonic()
+                    if current.last_activity - current.last_report >= 5.0:
+                        current.last_report = current.last_activity
+                        try:
+                            self._write_header(current)
+                        except OSError as exc:
+                            log.error("header update %s failed: %s", current.path, exc)
+                        duration = (
+                            current.received / current.rate if current.rate else 0.0
+                        )
+                        log.info(
+                            "recording %s: %.1f s, %d samples",
+                            current.path,
+                            duration,
+                            current.received,
+                        )
                     await self._send_ack(writer, current.key[1], current.received)
 
                 elif typ == TYPE_END:
@@ -414,8 +469,28 @@ class IngestServer:
                 pass
 
 
-def open_serial(path: str) -> int:
-    """Open the USB CDC device in raw mode; no flow control, no echo."""
+def open_serial(path: str):
+    """Open a USB CDC device on POSIX or Windows.
+
+    POSIX uses a raw tty. Windows uses pyserial, because termios is unavailable.
+    """
+    if os.name == "nt":
+        try:
+            import serial
+        except ImportError as exc:
+            raise OSError(
+                "pyserial is required on Windows: python -m pip install pyserial"
+            ) from exc
+        return serial.Serial(
+            path,
+            baudrate=115200,
+            timeout=0.2,
+            write_timeout=1.0,
+            rtscts=False,
+            dsrdtr=False,
+            xonxoff=False,
+        )
+
     import termios
     import tty
 
@@ -430,20 +505,32 @@ def open_serial(path: str) -> int:
     return fd
 
 
-def _pump(fd: int, loop, reader: asyncio.StreamReader, stop: threading.Event) -> None:
-    """Move bytes from the tty into the asyncio reader from a helper thread."""
+def _pump(fd, loop, reader: asyncio.StreamReader, stop: threading.Event) -> None:
+    """Move bytes from the serial device into the asyncio reader."""
     try:
-        while not stop.is_set():
-            ready, _, _ = select.select([fd], [], [], 0.2)
-            if not ready:
-                continue
-            data = os.read(fd, 8192)
-            if not data:
-                break
-            try:
-                loop.call_soon_threadsafe(reader.feed_data, data)
-            except RuntimeError:
-                return
+        if os.name == "nt":
+            while not stop.is_set():
+                try:
+                    data = fd.read(8192)
+                except Exception:
+                    break
+                if data:
+                    try:
+                        loop.call_soon_threadsafe(reader.feed_data, data)
+                    except RuntimeError:
+                        return
+        else:
+            while not stop.is_set():
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if not ready:
+                    continue
+                data = os.read(fd, 8192)
+                if not data:
+                    break
+                try:
+                    loop.call_soon_threadsafe(reader.feed_data, data)
+                except RuntimeError:
+                    return
     except OSError:
         pass
     finally:
@@ -454,13 +541,17 @@ def _pump(fd: int, loop, reader: asyncio.StreamReader, stop: threading.Event) ->
 
 
 class SerialBytes:
-    """StreamWriter-compatible sink for a raw tty."""
+    """StreamWriter-compatible sink for a raw tty or pyserial port."""
 
-    def __init__(self, fd: int, label: str):
+    def __init__(self, fd, label: str):
         self.fd = fd
         self.label = label
 
     def write(self, data: bytes) -> None:
+        if os.name == "nt":
+            self.fd.write(data)
+            self.fd.flush()
+            return
         view = memoryview(data)
         while view:
             try:
@@ -508,10 +599,16 @@ async def _run_serial(path: str, out_dir: Path) -> None:
             finally:
                 stop.set()
                 thread.join(timeout=1.0)
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                if os.name == "nt":
+                    try:
+                        fd.close()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
             log.warning("serial: %s closed; reopening", path)
             await asyncio.sleep(RETRY_OPEN_SECONDS)
     finally:
@@ -524,9 +621,13 @@ def main() -> None:
         "--serial",
         required=True,
         metavar="DEVICE",
-        help="USB serial device, e.g. /dev/ttyACM0",
+        help="USB serial device, e.g. /dev/ttyACM0 or COM3",
     )
-    parser.add_argument("--out", default="./recordings", type=Path)
+    parser.add_argument(
+        "--out",
+        default=Path(__file__).resolve().parent / "recordings",
+        type=Path,
+    )
     args = parser.parse_args()
 
     logging.basicConfig(

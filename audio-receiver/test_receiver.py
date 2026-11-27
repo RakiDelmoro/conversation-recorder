@@ -13,7 +13,7 @@ import unittest
 import wave
 from pathlib import Path
 
-import ingest_server as srv
+import receiver as srv
 
 
 def _read_exact_fd(fd: int, size: int, timeout: float = 5.0) -> bytes:
@@ -151,6 +151,27 @@ class SerialTests(unittest.IsolatedAsyncioTestCase):
         self.send(srv.TYPE_START, self.start_payload(sid))
         self.assertEqual(await self.read_ack(), (sid, 0, 0))
         self.send_text(b"W (900) usb: a noisy log line\r\n")
+        self.send(srv.TYPE_AUDIO, pcm)
+        self.assertEqual(await self.read_ack(), (sid, 1600, 0))
+        self.send(srv.TYPE_END, srv.END.pack(sid, 1600, 0, 0))
+        self.assertEqual(await self.read_ack(), (sid, 1600, srv.FINAL_ACK_FLAG))
+
+        files = list(self.out.glob("*.wav"))
+        self.assertEqual(len(files), 1)
+        with wave.open(str(files[0]), "rb") as wf:
+            self.assertEqual(wf.getnframes(), 1600)
+            self.assertEqual(wf.readframes(1600), pcm)
+
+    async def test_duplicate_start_is_idempotent(self):
+        sid = 0x51A4
+        pcm = pcm_440(1600)
+        self.send(srv.TYPE_START, self.start_payload(sid))
+        self.assertEqual(await self.read_ack(), (sid, 0, 0))
+
+        # Opening the port can reset the CDC link; the device replays START.
+        self.send(srv.TYPE_START, self.start_payload(sid))
+        self.assertEqual(await self.read_ack(), (sid, 0, 0))
+
         self.send(srv.TYPE_AUDIO, pcm)
         self.assertEqual(await self.read_ack(), (sid, 1600, 0))
         self.send(srv.TYPE_END, srv.END.pack(sid, 1600, 0, 0))
